@@ -42,6 +42,9 @@ public:
     std::atomic<float> uiPhase { -1.0f };   // where we are in the curve (0..1), -1 = idle
     std::atomic<float> uiScPeak { 0.0f };   // loudest sidechain sample since the editor last looked
 
+    // Waveform display: peak level of the sound at each position in the cycle
+    std::array<std::atomic<float>, pump::kScopeBins> scopeIn, scopeOut, scopeSc;
+
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
 

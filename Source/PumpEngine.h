@@ -1,6 +1,6 @@
 // PumpEngine.h
-// All the "brains" of PumpKit that don't need JUCE: curve shapes, timing,
-// trigger detection and gain smoothing. Kept separate so it can be unit-tested.
+// All the "brains" of PumpKit that don't need JUCE: curve shapes, curve points,
+// timing, trigger detection and gain smoothing. Kept separate so it can be unit-tested.
 #pragma once
 
 #include <algorithm>
@@ -9,13 +9,18 @@
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
+#include <mutex>
 #include <string>
+#include <vector>
 
 namespace pump
 {
-constexpr int kCurvePoints = 64;
-constexpr int kNumPresets  = 16;
-constexpr int kNumLengths  = 12;
+constexpr int   kNumPresets = 16;
+constexpr int   kNumLengths = 12;
+constexpr int   kTableSize  = 256;    // the curve is baked into this many samples for the audio thread
+constexpr int   kMaxNodes   = 32;     // most points a curve can have
+constexpr float kMinGap     = 0.004f; // closest two points can get (as a fraction of the cycle)
+constexpr int   kScopeBins  = 256;    // resolution of the waveform display
 
 //==============================================================================
 // Length (duration) choices, in quarter notes
@@ -93,51 +98,183 @@ inline float presetValue (int preset, float x)
 }
 
 //==============================================================================
-// The editable curve: 64 points, linear interpolation between them.
-// Points are atomics so the UI thread can draw into it while audio reads it.
+// Curve points
+struct Node
+{
+    float x = 0.0f;   // time in the cycle, 0..1
+    float y = 0.0f;   // volume, 0 = silent, 1 = full
+};
+
+// Ramer-Douglas-Peucker on evenly spaced samples: keeps only the points that matter
+inline void simplifyRange (const std::vector<float>& ys, int a, int b, float tol, std::vector<char>& keep)
+{
+    if (b <= a + 1)
+        return;
+
+    float worst = 0.0f;
+    int idx = -1;
+    for (int i = a + 1; i < b; ++i)
+    {
+        const float t = (float) (i - a) / (float) (b - a);
+        const float line = ys[(size_t) a] + (ys[(size_t) b] - ys[(size_t) a]) * t;
+        const float e = std::fabs (ys[(size_t) i] - line);
+        if (e > worst) { worst = e; idx = i; }
+    }
+
+    if (idx >= 0 && worst > tol)
+    {
+        keep[(size_t) idx] = 1;
+        simplifyRange (ys, a, idx, tol, keep);
+        simplifyRange (ys, idx, b, tol, keep);
+    }
+}
+
+inline std::vector<Node> simplify (const std::vector<float>& ys, float tol, int maxNodes)
+{
+    const int n = (int) ys.size();
+    std::vector<Node> out;
+    if (n < 2)
+        return out;
+
+    float t = tol;
+    for (int attempt = 0; attempt < 12; ++attempt)
+    {
+        std::vector<char> keep ((size_t) n, 0);
+        keep[0] = keep[(size_t) n - 1] = 1;
+        simplifyRange (ys, 0, n - 1, t, keep);
+
+        out.clear();
+        for (int i = 0; i < n; ++i)
+            if (keep[(size_t) i])
+                out.push_back ({ (float) i / (float) (n - 1), std::clamp (ys[(size_t) i], 0.0f, 1.0f) });
+
+        if ((int) out.size() <= maxNodes)
+            break;
+        t *= 1.5f;
+    }
+    return out;
+}
+
+//==============================================================================
+// The editable curve: a list of points (edited from the UI thread) that is baked
+// into a 256-sample table which the audio thread reads without any locking.
 class CurveTable
 {
 public:
-    CurveTable() { setPreset (0); }
-
-    void setPreset (int preset)
+    CurveTable()
     {
-        for (int i = 0; i < kCurvePoints; ++i)
-            pts[(size_t) i].store (presetValue (preset, (float) i / (float) (kCurvePoints - 1)),
-                                   std::memory_order_relaxed);
+        for (auto& t : table)
+            t.store (0.0f, std::memory_order_relaxed);
+        setPreset (0);
     }
 
-    void setPoint (int i, float v)
-    {
-        if (i >= 0 && i < kCurvePoints)
-            pts[(size_t) i].store (std::clamp (v, 0.0f, 1.0f), std::memory_order_relaxed);
-    }
-
-    float getPoint (int i) const
-    {
-        return pts[(size_t) std::clamp (i, 0, kCurvePoints - 1)].load (std::memory_order_relaxed);
-    }
-
+    // ---- audio thread: gain at position x (0..1)
     float eval (float x) const
     {
         x = std::clamp (x, 0.0f, 1.0f);
-        const float f = x * (float) (kCurvePoints - 1);
+        const float f = x * (float) (kTableSize - 1);
         const int i = (int) f;
-        if (i >= kCurvePoints - 1)
-            return getPoint (kCurvePoints - 1);
+        if (i >= kTableSize - 1)
+            return table[(size_t) kTableSize - 1].load (std::memory_order_relaxed);
         const float frac = f - (float) i;
-        const float a = getPoint (i), b = getPoint (i + 1);
+        const float a = table[(size_t) i].load (std::memory_order_relaxed);
+        const float b = table[(size_t) i + 1].load (std::memory_order_relaxed);
         return a + (b - a) * frac;
     }
 
+    // ---- UI thread
+    std::vector<Node> getNodes() const
+    {
+        std::lock_guard<std::mutex> g (lock);
+        return nodes;
+    }
+
+    bool isSmooth() const { return smooth.load(); }
+
+    void setSmooth (bool s)
+    {
+        std::lock_guard<std::mutex> g (lock);
+        smooth.store (s);
+        bake();
+    }
+
+    void setPreset (int preset)
+    {
+        std::vector<float> ys (257);
+        for (size_t i = 0; i < ys.size(); ++i)
+            ys[i] = presetValue (preset, (float) i / 256.0f);
+        setNodes (simplify (ys, 0.012f, 24));
+    }
+
+    void setNodes (std::vector<Node> v)
+    {
+        std::lock_guard<std::mutex> g (lock);
+        nodes = sanitize (std::move (v));
+        bake();
+    }
+
+    // returns the index of the new point, or -1 if there is no room
+    int addNode (float x, float y)
+    {
+        std::lock_guard<std::mutex> g (lock);
+        if ((int) nodes.size() >= kMaxNodes)
+            return -1;
+
+        x = std::clamp (x, 0.0f, 1.0f);
+        y = std::clamp (y, 0.0f, 1.0f);
+
+        size_t i = 1;
+        while (i < nodes.size() - 1 && nodes[i].x <= x)
+            ++i;
+
+        const float lo = nodes[i - 1].x + kMinGap;
+        const float hi = nodes[i].x - kMinGap;
+        if (lo > hi)
+            return -1;
+
+        nodes.insert (nodes.begin() + (std::ptrdiff_t) i, Node { std::clamp (x, lo, hi), y });
+        bake();
+        return (int) i;
+    }
+
+    void moveNode (int i, float x, float y)
+    {
+        std::lock_guard<std::mutex> g (lock);
+        if (i < 0 || i >= (int) nodes.size())
+            return;
+
+        auto& n = nodes[(size_t) i];
+        n.y = std::clamp (y, 0.0f, 1.0f);
+
+        if (i > 0 && i < (int) nodes.size() - 1)
+        {
+            const float lo = nodes[(size_t) i - 1].x + kMinGap;
+            const float hi = nodes[(size_t) i + 1].x - kMinGap;
+            n.x = std::clamp (x, lo, std::max (lo, hi));
+        }
+        bake();
+    }
+
+    // the first and last point can't be removed
+    bool removeNode (int i)
+    {
+        std::lock_guard<std::mutex> g (lock);
+        if (i <= 0 || i >= (int) nodes.size() - 1)
+            return false;
+        nodes.erase (nodes.begin() + i);
+        bake();
+        return true;
+    }
+
+    // ---- saving / loading
     std::string toString() const
     {
-        std::string s;
-        char buf[32];
-        for (int i = 0; i < kCurvePoints; ++i)
+        std::lock_guard<std::mutex> g (lock);
+        std::string s = smooth.load() ? "pk2;1" : "pk2;0";
+        char buf[64];
+        for (const auto& n : nodes)
         {
-            std::snprintf (buf, sizeof (buf), "%.4f", (double) getPoint (i));
-            if (i > 0) s += ',';
+            std::snprintf (buf, sizeof (buf), ";%.5f,%.5f", (double) n.x, (double) n.y);
             s += buf;
         }
         return s;
@@ -145,24 +282,165 @@ public:
 
     bool fromString (const std::string& s)
     {
-        std::array<float, kCurvePoints> tmp {};
+        if (s.rfind ("pk2;", 0) == 0)
+        {
+            std::vector<Node> v;
+            const char* p = s.c_str() + 4;
+            const bool sm = *p == '1';
+            while (*p != '\0' && *p != ';') ++p;
+
+            while (*p == ';')
+            {
+                ++p;
+                char* end = nullptr;
+                const float x = std::strtof (p, &end);
+                if (end == p || *end != ',') return false;
+                p = end + 1;
+                const float y = std::strtof (p, &end);
+                if (end == p) return false;
+                p = end;
+                v.push_back ({ x, y });
+            }
+            if (v.size() < 2)
+                return false;
+
+            setNodes (std::move (v));
+            setSmooth (sm);
+            return true;
+        }
+
+        // older format: 64 comma-separated heights
+        std::vector<float> ys;
         const char* p = s.c_str();
-        for (int i = 0; i < kCurvePoints; ++i)
+        for (int i = 0; i < 64; ++i)
         {
             char* end = nullptr;
             const float v = std::strtof (p, &end);
             if (end == p) return false;
-            tmp[(size_t) i] = v;
+            ys.push_back (v);
             p = end;
             if (*p == ',') ++p;
         }
-        for (int i = 0; i < kCurvePoints; ++i)
-            setPoint (i, tmp[(size_t) i]);
+        setNodes (simplify (ys, 0.012f, 24));
         return true;
     }
 
 private:
-    std::array<std::atomic<float>, kCurvePoints> pts;
+    static std::vector<Node> sanitize (std::vector<Node> v)
+    {
+        if (v.size() < 2)
+            v = { { 0.0f, 0.0f }, { 1.0f, 1.0f } };
+
+        for (auto& n : v)
+        {
+            n.x = std::clamp (n.x, 0.0f, 1.0f);
+            n.y = std::clamp (n.y, 0.0f, 1.0f);
+        }
+
+        std::stable_sort (v.begin(), v.end(), [] (const Node& a, const Node& b) { return a.x < b.x; });
+
+        if ((int) v.size() > kMaxNodes)
+        {
+            const Node last = v.back();
+            v.resize ((size_t) kMaxNodes - 1);
+            v.push_back (last);
+        }
+
+        v.front().x = 0.0f;
+        v.back().x  = 1.0f;
+
+        const size_t n = v.size();
+        for (size_t i = 1; i + 1 < n; ++i)
+            v[i].x = std::max (v[i].x, v[i - 1].x + kMinGap);
+        for (size_t i = n - 2; i >= 1; --i)
+            v[i].x = std::min (v[i].x, v[i + 1].x - kMinGap);
+
+        return v;
+    }
+
+    static float sgn (float v) { return v > 0.0f ? 1.0f : (v < 0.0f ? -1.0f : 0.0f); }
+
+    static float endSlope (float h0, float h1, float d0, float d1)
+    {
+        float s = ((2.0f * h0 + h1) * d0 - h0 * d1) / (h0 + h1);
+        if (sgn (s) != sgn (d0))
+            s = 0.0f;
+        else if (sgn (d0) != sgn (d1) && std::fabs (s) > 3.0f * std::fabs (d0))
+            s = 3.0f * d0;
+        return s;
+    }
+
+    // must be called with the lock held
+    void bake()
+    {
+        const size_t n = nodes.size();
+        const bool sm = smooth.load();
+
+        std::vector<float> m (n, 0.0f);
+        if (sm)
+        {
+            std::vector<float> d (n - 1), h (n - 1);
+            for (size_t k = 0; k + 1 < n; ++k)
+            {
+                h[k] = nodes[k + 1].x - nodes[k].x;
+                d[k] = (nodes[k + 1].y - nodes[k].y) / h[k];
+            }
+
+            if (n == 2)
+            {
+                m[0] = m[1] = d[0];
+            }
+            else
+            {
+                for (size_t k = 1; k + 1 < n; ++k)
+                {
+                    if (d[k - 1] * d[k] <= 0.0f)
+                        m[k] = 0.0f;
+                    else
+                    {
+                        const float w1 = 2.0f * h[k] + h[k - 1];
+                        const float w2 = h[k] + 2.0f * h[k - 1];
+                        m[k] = (w1 + w2) / (w1 / d[k - 1] + w2 / d[k]);
+                    }
+                }
+                m[0]     = endSlope (h[0], h[1], d[0], d[1]);
+                m[n - 1] = endSlope (h[n - 2], h[n - 3], d[n - 2], d[n - 3]);
+            }
+        }
+
+        size_t seg = 0;
+        for (int t = 0; t < kTableSize; ++t)
+        {
+            const float x = (float) t / (float) (kTableSize - 1);
+            while (seg + 2 < n && x > nodes[seg + 1].x)
+                ++seg;
+
+            const Node& a = nodes[seg];
+            const Node& b = nodes[seg + 1];
+            const float h = b.x - a.x;
+            const float u = h > 0.0f ? std::clamp ((x - a.x) / h, 0.0f, 1.0f) : 1.0f;
+
+            float y;
+            if (sm)
+            {
+                const float u2 = u * u, u3 = u2 * u;
+                y = (2.0f * u3 - 3.0f * u2 + 1.0f) * a.y
+                  + (u3 - 2.0f * u2 + u) * h * m[seg]
+                  + (-2.0f * u3 + 3.0f * u2) * b.y
+                  + (u3 - u2) * h * m[seg + 1];
+            }
+            else
+            {
+                y = a.y + (b.y - a.y) * u;
+            }
+            table[(size_t) t].store (std::clamp (y, 0.0f, 1.0f), std::memory_order_relaxed);
+        }
+    }
+
+    mutable std::mutex lock;
+    std::vector<Node> nodes;
+    std::atomic<bool> smooth { false };
+    std::array<std::atomic<float>, kTableSize> table;
 };
 
 //==============================================================================
@@ -194,30 +472,54 @@ private:
 };
 
 //==============================================================================
-// One-pole smoothing of the gain, so steep curve edges don't click
+// Smooths the gain so steep curve edges don't click.
+// Two one-pole filters in a row (rounder than one), a tiny built-in minimum so
+// a hard edge can never be a true click, and the smoothing time itself glides
+// to its new value so turning the knob can't cause a jump.
 class GainSmoother
 {
 public:
-    void prepare (double sr) { sampleRate = sr; setTimeMs (timeMs); value = 1.0f; }
+    static constexpr float kMinMs = 0.5f;
 
-    void setTimeMs (float ms)
+    void prepare (double sr)
     {
-        timeMs = ms;
-        coef = ms <= 0.01f ? 1.0f
-                           : (float) (1.0 - std::exp (-1.0 / (0.001 * (double) ms * sampleRate)));
+        sampleRate = sr;
+        glide = (float) (1.0 - std::exp (-1.0 / (0.02 * sr)));   // ~20 ms
+        timeCur = timeTarget = std::max (timeTarget, kMinMs);
+        updateCoef();
+        reset (1.0f);
     }
 
-    void reset (float v = 1.0f) { value = v; }
+    void setTimeMs (float ms) { timeTarget = std::max (ms, kMinMs); }
+
+    void reset (float v = 1.0f) { v1 = v2 = v; }
 
     float process (float target)
     {
-        value += coef * (target - value);
-        return value;
+        if (timeCur != timeTarget)
+        {
+            timeCur += glide * (timeTarget - timeCur);
+            if (std::fabs (timeTarget - timeCur) < 1e-4f)
+                timeCur = timeTarget;
+            if (timeCur == timeTarget || (++counter & 15) == 0)
+                updateCoef();
+        }
+        v1 += coef * (target - v1);
+        v2 += coef * (v1 - v2);
+        return v2;
     }
 
 private:
+    void updateCoef()
+    {
+        const double tau = 0.5 * 0.001 * (double) timeCur;   // each of the two stages
+        coef = (float) (1.0 - std::exp (-1.0 / (tau * sampleRate)));
+    }
+
     double sampleRate = 44100.0;
-    float timeMs = 2.0f, coef = 1.0f, value = 1.0f;
+    float timeCur = 2.0f, timeTarget = 2.0f, glide = 0.01f, coef = 0.1f;
+    float v1 = 1.0f, v2 = 1.0f;
+    unsigned counter = 0;
 };
 
 //==============================================================================

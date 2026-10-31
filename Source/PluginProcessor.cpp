@@ -68,7 +68,8 @@ PumpKitProcessor::PumpKitProcessor()
     : juce::AudioProcessor (BusesProperties()
                                 .withInput  ("Input",     juce::AudioChannelSet::stereo(), true)
                                 .withOutput ("Output",    juce::AudioChannelSet::stereo(), true)
-                                .withInput  ("Sidechain", juce::AudioChannelSet::stereo(), false)),
+                                // switched on from the start, so FL Studio offers it in the plugin's Processing page
+                                .withInput  ("Sidechain", juce::AudioChannelSet::stereo(), true)),
       apvts (*this, nullptr, "PumpKitState", createLayout())
 {
     pMode      = apvts.getRawParameterValue ("mode");
@@ -79,6 +80,10 @@ PumpKitProcessor::PumpKitProcessor()
     pFreq      = apvts.getRawParameterValue ("splitFreq");
     pThreshold = apvts.getRawParameterValue ("threshold");
     pRetrigger = apvts.getRawParameterValue ("retrigger");
+
+    for (auto* arr : { &scopeIn, &scopeOut, &scopeSc })
+        for (auto& v : *arr)
+            v.store (0.0f, std::memory_order_relaxed);
 
     trigPos.reserve (2048);
 }
@@ -215,6 +220,7 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     // ---- main loop
     float scPeak = 0.0f, uiPh = -1.0f;
     size_t ti = 0;
+    int lastBin = -1;
 
     for (int i = 0; i < numSamples; ++i)
     {
@@ -266,10 +272,12 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
         const float mix = mixSmooth.getNextValue();
         const float eff = 1.0f - mix * (1.0f - gs);
 
+        float inAbs = 0.0f, outAbs = 0.0f;
         for (int c = 0; c < numCh; ++c)
         {
             float* d = buffer.getWritePointer (c);
             const float x = d[i];
+            inAbs = std::max (inAbs, std::abs (x));
             if (split)
             {
                 float lo = 0.0f, hi = 0.0f;
@@ -280,6 +288,29 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             {
                 d[i] = x * eff;
             }
+            outAbs = std::max (outAbs, std::abs (d[i]));
+        }
+
+        // feed the waveform display: remember the loudest level seen at this point of the cycle
+        if (uiPh >= 0.0f)
+        {
+            const int bin = std::min (pump::kScopeBins - 1, (int) (uiPh * (float) pump::kScopeBins));
+            const size_t b = (size_t) bin;
+            if (bin != lastBin)
+            {
+                lastBin = bin;
+                // fade what was there on the previous pass, so old audio disappears over time
+                scopeIn[b].store  (scopeIn[b].load  (std::memory_order_relaxed) * 0.85f, std::memory_order_relaxed);
+                scopeOut[b].store (scopeOut[b].load (std::memory_order_relaxed) * 0.85f, std::memory_order_relaxed);
+                scopeSc[b].store  (scopeSc[b].load  (std::memory_order_relaxed) * 0.85f, std::memory_order_relaxed);
+            }
+            if (inAbs   > scopeIn[b].load  (std::memory_order_relaxed)) scopeIn[b].store  (inAbs,   std::memory_order_relaxed);
+            if (outAbs  > scopeOut[b].load (std::memory_order_relaxed)) scopeOut[b].store (outAbs,  std::memory_order_relaxed);
+            if (scLevel > scopeSc[b].load  (std::memory_order_relaxed)) scopeSc[b].store  (scLevel, std::memory_order_relaxed);
+        }
+        else
+        {
+            lastBin = -1;
         }
     }
 
