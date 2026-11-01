@@ -6,6 +6,7 @@
 #include <vector>
 
 #include "PumpEngine.h"
+#include "Presets.h"
 
 class PumpKitProcessor : public juce::AudioProcessor
 {
@@ -39,8 +40,13 @@ public:
     // shared with the editor
     juce::AudioProcessorValueTreeState apvts;
     pump::CurveTable curve;
-    std::atomic<float> uiPhase { -1.0f };   // where we are in the curve (0..1), -1 = idle
-    std::atomic<float> uiScPeak { 0.0f };   // loudest sidechain sample since the editor last looked
+
+    std::atomic<int> genreIndex  { 0 };     // which preset group is selected (sets the colour)
+    std::atomic<int> presetIndex { 0 };
+
+    std::atomic<float> uiPhase    { -1.0f }; // where we are in the curve (0..1), -1 = idle
+    std::atomic<float> uiSrcLevel { 0.0f };  // level of the trigger source (sidechain or own sound), slowly falling
+    std::atomic<int>   trigCount  { 0 };     // goes up by one every time the curve is triggered
 
     // Waveform display: peak level of the sound at each position in the cycle
     std::array<std::atomic<float>, pump::kScopeBins> scopeIn, scopeOut, scopeSc;
@@ -56,6 +62,7 @@ private:
     std::atomic<float>* pFreq      = nullptr;
     std::atomic<float>* pThreshold = nullptr;
     std::atomic<float>* pRetrigger = nullptr;
+    std::atomic<float>* pSource    = nullptr;
 
     double sampleRate = 44100.0;
     double lastBpm = 120.0;

@@ -60,6 +60,10 @@ juce::AudioProcessorValueTreeState::ParameterLayout PumpKitProcessor::createLayo
         AudioParameterFloatAttributes().withStringFromValueFunction (msText)
                                        .withValueFromStringFunction (parseNumber)));
 
+    // Audio mode: listen to the sidechain input, or to the sound on this track itself
+    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "scSource", 1 }, "Trigger From",
+                                                        StringArray { "Sidechain", "This track" }, 0));
+
     return layout;
 }
 
@@ -80,10 +84,14 @@ PumpKitProcessor::PumpKitProcessor()
     pFreq      = apvts.getRawParameterValue ("splitFreq");
     pThreshold = apvts.getRawParameterValue ("threshold");
     pRetrigger = apvts.getRawParameterValue ("retrigger");
+    pSource    = apvts.getRawParameterValue ("scSource");
 
     for (auto* arr : { &scopeIn, &scopeOut, &scopeSc })
         for (auto& v : *arr)
             v.store (0.0f, std::memory_order_relaxed);
+
+    // start on the first Hardstyle preset
+    curve.setNodes (pump::genres()[0].presets[0].nodes);
 
     trigPos.reserve (2048);
 }
@@ -138,9 +146,10 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
         return;
     }
 
-    const int mode      = (int) pMode->load();
-    const int lengthIdx = (int) pLength->load();
-    const bool split    = pSplit->load() > 0.5f;
+    const int mode       = (int) pMode->load();
+    const int lengthIdx  = (int) pLength->load();
+    const bool split     = pSplit->load() > 0.5f;
+    const bool ownSource = pSource->load() > 0.5f;
 
     mixSmooth.setTargetValue (pMix->load() * 0.01f);
     smoother.setTimeMs (pSmooth->load());
@@ -218,16 +227,22 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     wasSplit = split;
 
     // ---- main loop
-    float scPeak = 0.0f, uiPh = -1.0f;
+    float srcPeak = 0.0f, uiPh = -1.0f;
     size_t ti = 0;
     int lastBin = -1;
+    int triggers = 0;
 
     for (int i = 0; i < numSamples; ++i)
     {
-        float scLevel = 0.0f;
+        // level of the sound on this track (before we change it) and of the sidechain input
+        float own = 0.0f, scIn = 0.0f;
+        for (int c = 0; c < numCh; ++c)
+            own = std::max (own, std::abs (buffer.getReadPointer (c)[i]));
         for (int c = 0; c < scCh; ++c)
-            scLevel = std::max (scLevel, std::abs (sc[c][i]));
-        scPeak = std::max (scPeak, scLevel);
+            scIn = std::max (scIn, std::abs (sc[c][i]));
+
+        const float srcLevel = ownSource ? own : scIn;   // what triggers the curve in Audio mode
+        srcPeak = std::max (srcPeak, srcLevel);
 
         float g = 1.0f;
         uiPh = -1.0f;
@@ -256,12 +271,14 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
                 while (ti < trigPos.size() && trigPos[ti] <= i)
                 {
                     oneShot.trigger();
+                    ++triggers;
                     ++ti;
                 }
             }
-            else if (onset.process (scLevel))
+            else if (onset.process (srcLevel))
             {
                 oneShot.trigger();
+                ++triggers;
             }
 
             g = oneShot.next (curve);
@@ -272,12 +289,11 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
         const float mix = mixSmooth.getNextValue();
         const float eff = 1.0f - mix * (1.0f - gs);
 
-        float inAbs = 0.0f, outAbs = 0.0f;
+        float outAbs = 0.0f;
         for (int c = 0; c < numCh; ++c)
         {
             float* d = buffer.getWritePointer (c);
             const float x = d[i];
-            inAbs = std::max (inAbs, std::abs (x));
             if (split)
             {
                 float lo = 0.0f, hi = 0.0f;
@@ -304,9 +320,9 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
                 scopeOut[b].store (scopeOut[b].load (std::memory_order_relaxed) * 0.85f, std::memory_order_relaxed);
                 scopeSc[b].store  (scopeSc[b].load  (std::memory_order_relaxed) * 0.85f, std::memory_order_relaxed);
             }
-            if (inAbs   > scopeIn[b].load  (std::memory_order_relaxed)) scopeIn[b].store  (inAbs,   std::memory_order_relaxed);
-            if (outAbs  > scopeOut[b].load (std::memory_order_relaxed)) scopeOut[b].store (outAbs,  std::memory_order_relaxed);
-            if (scLevel > scopeSc[b].load  (std::memory_order_relaxed)) scopeSc[b].store  (scLevel, std::memory_order_relaxed);
+            if (own     > scopeIn[b].load  (std::memory_order_relaxed)) scopeIn[b].store  (own,      std::memory_order_relaxed);
+            if (outAbs  > scopeOut[b].load (std::memory_order_relaxed)) scopeOut[b].store (outAbs,   std::memory_order_relaxed);
+            if (srcLevel > scopeSc[b].load (std::memory_order_relaxed)) scopeSc[b].store  (srcLevel, std::memory_order_relaxed);
         }
         else
         {
@@ -315,8 +331,9 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     }
 
     uiPhase.store (uiPh);
-    if (scPeak > uiScPeak.load())
-        uiScPeak.store (scPeak);
+    uiSrcLevel.store (std::max (srcPeak, uiSrcLevel.load() * 0.9f));
+    if (triggers > 0)
+        trigCount.fetch_add (triggers);
 }
 
 //==============================================================================
@@ -329,6 +346,8 @@ void PumpKitProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     auto state = apvts.copyState();
     state.setProperty ("curve", juce::String (curve.toString()), nullptr);
+    state.setProperty ("genre", genreIndex.load(), nullptr);
+    state.setProperty ("preset", presetIndex.load(), nullptr);
     if (auto xml = state.createXml())
         copyXmlToBinary (*xml, destData);
 }
@@ -341,8 +360,15 @@ void PumpKitProcessor::setStateInformation (const void* data, int sizeInBytes)
         {
             auto tree = juce::ValueTree::fromXml (*xml);
             apvts.replaceState (tree);
+
             if (tree.hasProperty ("curve"))
                 curve.fromString (tree["curve"].toString().toStdString());
+
+            const int ng = pump::numGenres();
+            const int g = juce::jlimit (0, ng - 1, (int) tree.getProperty ("genre", 0));
+            const int np = (int) pump::genres()[(size_t) g].presets.size();
+            genreIndex.store (g);
+            presetIndex.store (juce::jlimit (0, np - 1, (int) tree.getProperty ("preset", 0)));
         }
     }
 }

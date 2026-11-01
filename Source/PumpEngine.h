@@ -1,5 +1,5 @@
 // PumpEngine.h
-// All the "brains" of PumpKit that don't need JUCE: curve shapes, curve points,
+// All the "brains" of PumpKit that don't need JUCE: curve points and bends,
 // timing, trigger detection and gain smoothing. Kept separate so it can be unit-tested.
 #pragma once
 
@@ -15,7 +15,7 @@
 
 namespace pump
 {
-constexpr int   kNumPresets = 16;
+constexpr int   kNumPresets = 16;     // the 16 basic shapes (used for the "Utility" group)
 constexpr int   kNumLengths = 12;
 constexpr int   kTableSize  = 256;    // the curve is baked into this many samples for the audio thread
 constexpr int   kMaxNodes   = 32;     // most points a curve can have
@@ -50,7 +50,7 @@ inline double syncPhase (double ppqQuarters, double lengthInQuarters)
 }
 
 //==============================================================================
-// The 16 built-in curves. x = time through the cycle (0..1),
+// 16 basic mathematical shapes. x = time through the cycle (0..1),
 // result = gain (0 = fully ducked, 1 = no ducking).
 inline const char* presetName (int i)
 {
@@ -98,35 +98,57 @@ inline float presetValue (int preset, float x)
 }
 
 //==============================================================================
-// Curve points
+// A curve point. Between this point and the next one the line is straight, plus a
+// "bend": the middle of the segment is pushed up (+) or down (-) by this amount,
+// following a smooth arch. 0 = straight. The bend dot in the editor sets it.
 struct Node
 {
-    float x = 0.0f;   // time in the cycle, 0..1
-    float y = 0.0f;   // volume, 0 = silent, 1 = full
+    float x = 0.0f;      // time in the cycle, 0..1
+    float y = 0.0f;      // volume, 0 = silent, 1 = full
+    float bend = 0.0f;   // bend of the segment that starts at this point (-1..1)
 };
 
-// Ramer-Douglas-Peucker on evenly spaced samples: keeps only the points that matter
-inline void simplifyRange (const std::vector<float>& ys, int a, int b, float tol, std::vector<char>& keep)
+inline float segmentValue (float ya, float yb, float bend, float u)
 {
-    if (b <= a + 1)
-        return;
+    return std::clamp (ya + (yb - ya) * u + bend * 4.0f * u * (1.0f - u), 0.0f, 1.0f);
+}
+
+//------------------------------------------------------------------------------
+// Turning a sampled shape into a few points + bends (used for the basic shapes
+// and for loading projects saved by older versions).
+struct FitSeg { int a = 0, b = 0; float bend = 0.0f; };
+
+inline void fitRange (const std::vector<float>& ys, int a, int b, float tol, std::vector<FitSeg>& out)
+{
+    const float ya = ys[(size_t) a], yb = ys[(size_t) b];
+
+    float bend = 0.0f;
+    if (b - a >= 4)
+    {
+        const float pos = 0.5f * (float) (a + b);
+        const int i0 = (int) std::floor (pos);
+        const float fr = pos - (float) i0;
+        const float ymid = ys[(size_t) i0] + (ys[(size_t) std::min (i0 + 1, b)] - ys[(size_t) i0]) * fr;
+        bend = std::clamp (ymid - 0.5f * (ya + yb), -1.0f, 1.0f);
+    }
 
     float worst = 0.0f;
-    int idx = -1;
+    int wi = -1;
     for (int i = a + 1; i < b; ++i)
     {
-        const float t = (float) (i - a) / (float) (b - a);
-        const float line = ys[(size_t) a] + (ys[(size_t) b] - ys[(size_t) a]) * t;
-        const float e = std::fabs (ys[(size_t) i] - line);
-        if (e > worst) { worst = e; idx = i; }
+        const float u = (float) (i - a) / (float) (b - a);
+        const float e = std::fabs (ys[(size_t) i] - segmentValue (ya, yb, bend, u));
+        if (e > worst) { worst = e; wi = i; }
     }
 
-    if (idx >= 0 && worst > tol)
+    if (wi < 0 || worst <= tol || b - a <= 1)
     {
-        keep[(size_t) idx] = 1;
-        simplifyRange (ys, a, idx, tol, keep);
-        simplifyRange (ys, idx, b, tol, keep);
+        out.push_back ({ a, b, bend });
+        return;
     }
+
+    fitRange (ys, a, wi, tol, out);
+    fitRange (ys, wi, b, tol, out);
 }
 
 inline std::vector<Node> simplify (const std::vector<float>& ys, float tol, int maxNodes)
@@ -139,14 +161,13 @@ inline std::vector<Node> simplify (const std::vector<float>& ys, float tol, int 
     float t = tol;
     for (int attempt = 0; attempt < 12; ++attempt)
     {
-        std::vector<char> keep ((size_t) n, 0);
-        keep[0] = keep[(size_t) n - 1] = 1;
-        simplifyRange (ys, 0, n - 1, t, keep);
+        std::vector<FitSeg> segs;
+        fitRange (ys, 0, n - 1, t, segs);
 
         out.clear();
-        for (int i = 0; i < n; ++i)
-            if (keep[(size_t) i])
-                out.push_back ({ (float) i / (float) (n - 1), std::clamp (ys[(size_t) i], 0.0f, 1.0f) });
+        for (const auto& s : segs)
+            out.push_back ({ (float) s.a / (float) (n - 1), std::clamp (ys[(size_t) s.a], 0.0f, 1.0f), s.bend });
+        out.push_back ({ 1.0f, std::clamp (ys[(size_t) n - 1], 0.0f, 1.0f), 0.0f });
 
         if ((int) out.size() <= maxNodes)
             break;
@@ -156,8 +177,8 @@ inline std::vector<Node> simplify (const std::vector<float>& ys, float tol, int 
 }
 
 //==============================================================================
-// The editable curve: a list of points (edited from the UI thread) that is baked
-// into a 256-sample table which the audio thread reads without any locking.
+// The editable curve: a list of points with bends (edited from the UI thread) that is
+// baked into a 256-sample table which the audio thread reads without any locking.
 class CurveTable
 {
 public:
@@ -165,7 +186,7 @@ public:
     {
         for (auto& t : table)
             t.store (0.0f, std::memory_order_relaxed);
-        setPreset (0);
+        setNodes ({ { 0.0f, 0.0f, 0.0f }, { 1.0f, 1.0f, 0.0f } });
     }
 
     // ---- audio thread: gain at position x (0..1)
@@ -187,23 +208,6 @@ public:
     {
         std::lock_guard<std::mutex> g (lock);
         return nodes;
-    }
-
-    bool isSmooth() const { return smooth.load(); }
-
-    void setSmooth (bool s)
-    {
-        std::lock_guard<std::mutex> g (lock);
-        smooth.store (s);
-        bake();
-    }
-
-    void setPreset (int preset)
-    {
-        std::vector<float> ys (257);
-        for (size_t i = 0; i < ys.size(); ++i)
-            ys[i] = presetValue (preset, (float) i / 256.0f);
-        setNodes (simplify (ys, 0.012f, 24));
     }
 
     void setNodes (std::vector<Node> v)
@@ -232,7 +236,7 @@ public:
         if (lo > hi)
             return -1;
 
-        nodes.insert (nodes.begin() + (std::ptrdiff_t) i, Node { std::clamp (x, lo, hi), y });
+        nodes.insert (nodes.begin() + (std::ptrdiff_t) i, Node { std::clamp (x, lo, hi), y, 0.0f });
         bake();
         return (int) i;
     }
@@ -255,6 +259,16 @@ public:
         bake();
     }
 
+    // bend of the segment between point i and point i+1
+    void setBend (int i, float bend)
+    {
+        std::lock_guard<std::mutex> g (lock);
+        if (i < 0 || i + 1 >= (int) nodes.size())
+            return;
+        nodes[(size_t) i].bend = std::clamp (bend, -1.0f, 1.0f);
+        bake();
+    }
+
     // the first and last point can't be removed
     bool removeNode (int i)
     {
@@ -270,11 +284,11 @@ public:
     std::string toString() const
     {
         std::lock_guard<std::mutex> g (lock);
-        std::string s = smooth.load() ? "pk2;1" : "pk2;0";
-        char buf[64];
+        std::string s = "pk3";
+        char buf[96];
         for (const auto& n : nodes)
         {
-            std::snprintf (buf, sizeof (buf), ";%.5f,%.5f", (double) n.x, (double) n.y);
+            std::snprintf (buf, sizeof (buf), ";%.5f,%.5f,%.5f", (double) n.x, (double) n.y, (double) n.bend);
             s += buf;
         }
         return s;
@@ -282,13 +296,15 @@ public:
 
     bool fromString (const std::string& s)
     {
-        if (s.rfind ("pk2;", 0) == 0)
+        const bool v3 = s.rfind ("pk3;", 0) == 0;
+        const bool v2 = s.rfind ("pk2;", 0) == 0;   // version 1.1: points without bends
+        if (v3 || v2)
         {
-            std::vector<Node> v;
-            const char* p = s.c_str() + 4;
-            const bool sm = *p == '1';
-            while (*p != '\0' && *p != ';') ++p;
+            const char* p = s.c_str() + 3;
+            if (v2)
+                for (++p; *p != '\0' && *p != ';'; ++p) {}   // skip the old "smooth lines" flag
 
+            std::vector<Node> v;
             while (*p == ';')
             {
                 ++p;
@@ -299,17 +315,25 @@ public:
                 const float y = std::strtof (p, &end);
                 if (end == p) return false;
                 p = end;
-                v.push_back ({ x, y });
+                float b = 0.0f;
+                if (v3)
+                {
+                    if (*p != ',') return false;
+                    ++p;
+                    b = std::strtof (p, &end);
+                    if (end == p) return false;
+                    p = end;
+                }
+                v.push_back ({ x, y, b });
             }
             if (v.size() < 2)
                 return false;
 
             setNodes (std::move (v));
-            setSmooth (sm);
             return true;
         }
 
-        // older format: 64 comma-separated heights
+        // first version: 64 comma-separated heights
         std::vector<float> ys;
         const char* p = s.c_str();
         for (int i = 0; i < 64; ++i)
@@ -329,12 +353,13 @@ private:
     static std::vector<Node> sanitize (std::vector<Node> v)
     {
         if (v.size() < 2)
-            v = { { 0.0f, 0.0f }, { 1.0f, 1.0f } };
+            v = { { 0.0f, 0.0f, 0.0f }, { 1.0f, 1.0f, 0.0f } };
 
         for (auto& n : v)
         {
             n.x = std::clamp (n.x, 0.0f, 1.0f);
             n.y = std::clamp (n.y, 0.0f, 1.0f);
+            n.bend = std::clamp (n.bend, -1.0f, 1.0f);
         }
 
         std::stable_sort (v.begin(), v.end(), [] (const Node& a, const Node& b) { return a.x < b.x; });
@@ -348,6 +373,7 @@ private:
 
         v.front().x = 0.0f;
         v.back().x  = 1.0f;
+        v.back().bend = 0.0f;
 
         const size_t n = v.size();
         for (size_t i = 1; i + 1 < n; ++i)
@@ -358,56 +384,10 @@ private:
         return v;
     }
 
-    static float sgn (float v) { return v > 0.0f ? 1.0f : (v < 0.0f ? -1.0f : 0.0f); }
-
-    static float endSlope (float h0, float h1, float d0, float d1)
-    {
-        float s = ((2.0f * h0 + h1) * d0 - h0 * d1) / (h0 + h1);
-        if (sgn (s) != sgn (d0))
-            s = 0.0f;
-        else if (sgn (d0) != sgn (d1) && std::fabs (s) > 3.0f * std::fabs (d0))
-            s = 3.0f * d0;
-        return s;
-    }
-
     // must be called with the lock held
     void bake()
     {
         const size_t n = nodes.size();
-        const bool sm = smooth.load();
-
-        std::vector<float> m (n, 0.0f);
-        if (sm)
-        {
-            std::vector<float> d (n - 1), h (n - 1);
-            for (size_t k = 0; k + 1 < n; ++k)
-            {
-                h[k] = nodes[k + 1].x - nodes[k].x;
-                d[k] = (nodes[k + 1].y - nodes[k].y) / h[k];
-            }
-
-            if (n == 2)
-            {
-                m[0] = m[1] = d[0];
-            }
-            else
-            {
-                for (size_t k = 1; k + 1 < n; ++k)
-                {
-                    if (d[k - 1] * d[k] <= 0.0f)
-                        m[k] = 0.0f;
-                    else
-                    {
-                        const float w1 = 2.0f * h[k] + h[k - 1];
-                        const float w2 = h[k] + 2.0f * h[k - 1];
-                        m[k] = (w1 + w2) / (w1 / d[k - 1] + w2 / d[k]);
-                    }
-                }
-                m[0]     = endSlope (h[0], h[1], d[0], d[1]);
-                m[n - 1] = endSlope (h[n - 2], h[n - 3], d[n - 2], d[n - 3]);
-            }
-        }
-
         size_t seg = 0;
         for (int t = 0; t < kTableSize; ++t)
         {
@@ -419,27 +399,12 @@ private:
             const Node& b = nodes[seg + 1];
             const float h = b.x - a.x;
             const float u = h > 0.0f ? std::clamp ((x - a.x) / h, 0.0f, 1.0f) : 1.0f;
-
-            float y;
-            if (sm)
-            {
-                const float u2 = u * u, u3 = u2 * u;
-                y = (2.0f * u3 - 3.0f * u2 + 1.0f) * a.y
-                  + (u3 - 2.0f * u2 + u) * h * m[seg]
-                  + (-2.0f * u3 + 3.0f * u2) * b.y
-                  + (u3 - u2) * h * m[seg + 1];
-            }
-            else
-            {
-                y = a.y + (b.y - a.y) * u;
-            }
-            table[(size_t) t].store (std::clamp (y, 0.0f, 1.0f), std::memory_order_relaxed);
+            table[(size_t) t].store (segmentValue (a.y, b.y, a.bend, u), std::memory_order_relaxed);
         }
     }
 
     mutable std::mutex lock;
     std::vector<Node> nodes;
-    std::atomic<bool> smooth { false };
     std::array<std::atomic<float>, kTableSize> table;
 };
 
