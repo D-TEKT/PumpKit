@@ -60,13 +60,9 @@ juce::AudioProcessorValueTreeState::ParameterLayout PumpKitProcessor::createLayo
         AudioParameterFloatAttributes().withStringFromValueFunction (msText)
                                        .withValueFromStringFunction (parseNumber)));
 
-    // Audio mode: listen to the sidechain input, or to the sound on this track itself
+    // Audio mode: listen to the sidechain input (chosen in FL's plugin settings), or to the sound on this track itself
     layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "scSource", 1 }, "Trigger From",
-                                                        StringArray { "Sidechain", "This track", "Link A", "Link B", "Link C", "Link D", "Link E", "Link F", "Link G", "Link H" }, 0));
-
-    // Send this track's sound to a link channel, so another PumpKit can listen to it (this track is not changed)
-    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "sendTo", 1 }, "Send To",
-                                                        StringArray { "Not sending", "Send to A", "Send to B", "Send to C", "Send to D", "Send to E", "Send to F", "Send to G", "Send to H" }, 0));
+                                                        StringArray { "Sidechain", "This track" }, 0));
 
     // Speed: in note lengths (follows the song tempo) or in Hz (free speed, easy to automate)
     layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "rateMode", 1 }, "Rate Unit",
@@ -78,6 +74,32 @@ juce::AudioProcessorValueTreeState::ParameterLayout PumpKitProcessor::createLayo
         ParameterID { "rateHz", 1 }, "Rate (Hz)", rateRange, 2.6f,
         AudioParameterFloatAttributes().withStringFromValueFunction ([] (float v, int) { return juce::String (v, 2) + " Hz"; })
                                        .withValueFromStringFunction (parseNumber)));
+
+    // ---- effect modules (up to six), and how they are combined
+    StringArray types;
+    for (int t = 0; t < pump::kNumFxTypes; ++t)
+        types.add (pump::fxName (t));
+
+    for (int s = 0; s < pump::kMaxSlots; ++s)
+    {
+        const String n (s + 1);
+        layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "m" + n + "Type", 1 }, "Module " + n + " Effect",
+                                                            types, s == 0 ? pump::fxVolume : pump::fxOff));
+        layout.add (std::make_unique<AudioParameterFloat> (
+            ParameterID { "m" + n + "Depth", 1 }, "Module " + n + " Depth", NormalisableRange<float> (0.0f, 100.0f, 0.1f), 100.0f,
+            AudioParameterFloatAttributes().withStringFromValueFunction (pctText).withValueFromStringFunction (parseNumber)));
+        layout.add (std::make_unique<AudioParameterBool> (ParameterID { "m" + n + "On", 1 }, "Module " + n + " On", true));
+    }
+
+    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "combine", 1 }, "Combine",
+                                                        StringArray { "Chain", "Side by side" }, 0));
+
+    // editor helpers (remembered with the project, not meant for automation)
+    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "gridDiv", 1 }, "Grid",
+                                                        StringArray { "Off", "2", "4", "8", "16", "32" }, 2,
+                                                        AudioParameterChoiceAttributes().withAutomatable (false)));
+    layout.add (std::make_unique<AudioParameterBool> (ParameterID { "magnet", 1 }, "Magnet", true,
+                                                      AudioParameterBoolAttributes().withAutomatable (false)));
 
     return layout;
 }
@@ -102,17 +124,25 @@ PumpKitProcessor::PumpKitProcessor()
     pSource    = apvts.getRawParameterValue ("scSource");
     pRateMode  = apvts.getRawParameterValue ("rateMode");
     pRateHz    = apvts.getRawParameterValue ("rateHz");
-    pSendTo    = apvts.getRawParameterValue ("sendTo");
+    pCombine   = apvts.getRawParameterValue ("combine");
+    for (int s = 0; s < pump::kMaxSlots; ++s)
+    {
+        const juce::String n (s + 1);
+        pType[(size_t) s]  = apvts.getRawParameterValue ("m" + n + "Type");
+        pDepth[(size_t) s] = apvts.getRawParameterValue ("m" + n + "Depth");
+        pOn[(size_t) s]    = apvts.getRawParameterValue ("m" + n + "On");
+    }
 
     for (auto* arr : { &scopeIn, &scopeOut, &scopeSc })
         for (auto& v : *arr)
             v.store (0.0f, std::memory_order_relaxed);
 
     // start on the first Hardstyle preset
-    curve.setNodes (pump::genres()[0].presets[0].nodes);
+    for (int s = 0; s < pump::kMaxSlots; ++s)
+        curves[(size_t) s].setNodes (s == 0 ? pump::genres()[0].presets[0].nodes : pump::defaultNodes (s == 0 ? pump::fxVolume : pump::fxOff));
+    lastType.fill (-1);
 
     trigPos.reserve (2048);
-    linkTmp.reserve (8192);
 }
 
 bool PumpKitProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -135,14 +165,13 @@ void PumpKitProcessor::prepareToPlay (double sr, int samplesPerBlock)
     sampleRate = sr;
 
     juce::dsp::ProcessSpec spec { sr, (juce::uint32) samplesPerBlock, 2 };
-    crossover.prepare (spec);
-    crossover.reset();
+    for (auto& c : crossovers) { c.prepare (spec); c.reset(); }
+    for (auto& f : fx) f.prepare (sr);
+    lastType.fill (-1);
     lastCutoff = -1.0f;
     wasSplit = false;
 
-    linkTmp.reserve ((size_t) std::max (samplesPerBlock, 8192));
-    smoother.prepare (sr);
-    smoother.reset (1.0f);
+    for (auto& sm : smoothers) sm.prepare (sr);
     onset.prepare (sr);
     oneShot.stop();
 
@@ -156,12 +185,107 @@ void PumpKitProcessor::prepareToPlay (double sr, int samplesPerBlock)
 }
 
 //==============================================================================
+void PumpKitProcessor::setPlain (const juce::String& id, float value)
+{
+    if (auto* prm = apvts.getParameter (id))
+        prm->setValueNotifyingHost (prm->convertTo0to1 (value));
+}
+
+float PumpKitProcessor::getPlain (const juce::String& id) const
+{
+    return apvts.getRawParameterValue (id)->load();
+}
+
+int PumpKitProcessor::activeModules() const
+{
+    int n = 0;
+    for (int s = 0; s < pump::kMaxSlots; ++s)
+        if ((int) pType[(size_t) s]->load() != pump::fxOff)
+            ++n;
+    return n;
+}
+
+void PumpKitProcessor::copyModule (int from, int to)
+{
+    const juce::String f (from + 1), t (to + 1);
+    setPlain ("m" + t + "Type",  getPlain ("m" + f + "Type"));
+    setPlain ("m" + t + "Depth", getPlain ("m" + f + "Depth"));
+    setPlain ("m" + t + "On",    getPlain ("m" + f + "On"));
+    curves[(size_t) to].setNodes (curves[(size_t) from].getNodes());
+}
+
+int PumpKitProcessor::addModule (int type)
+{
+    for (int s = 0; s < pump::kMaxSlots; ++s)
+    {
+        if ((int) pType[(size_t) s]->load() == pump::fxOff)
+        {
+            const juce::String n (s + 1);
+            setPlain ("m" + n + "Type", (float) type);
+            setPlain ("m" + n + "Depth", 100.0f);
+            setPlain ("m" + n + "On", 1.0f);
+            curves[(size_t) s].setNodes (pump::defaultNodes (type));
+            selectedSlot.store (s);
+            return s;
+        }
+    }
+    return -1;
+}
+
+void PumpKitProcessor::removeModule (int slot)
+{
+    if (slot < 0 || slot >= pump::kMaxSlots || activeModules() <= 1)
+        return;
+
+    for (int k = slot; k + 1 < pump::kMaxSlots; ++k)
+        copyModule (k + 1, k);
+
+    const int last = pump::kMaxSlots - 1;
+    setPlain ("m" + juce::String (last + 1) + "Type", (float) pump::fxOff);
+    curves[(size_t) last].setNodes (pump::defaultNodes (pump::fxOff));
+
+    selectedSlot.store (std::min (slot, std::max (0, activeModules() - 1)));
+}
+
+void PumpKitProcessor::moveModule (int slot, int delta)
+{
+    const int other = slot + delta;
+    if (slot < 0 || other < 0 || slot >= pump::kMaxSlots || other >= pump::kMaxSlots)
+        return;
+    if ((int) pType[(size_t) slot]->load() == pump::fxOff || (int) pType[(size_t) other]->load() == pump::fxOff)
+        return;
+
+    const juce::String a (slot + 1);
+    const float type = getPlain ("m" + a + "Type"), depth = getPlain ("m" + a + "Depth"), on = getPlain ("m" + a + "On");
+    const auto nodes = curves[(size_t) slot].getNodes();
+
+    copyModule (other, slot);
+    const juce::String b (other + 1);
+    setPlain ("m" + b + "Type", type);
+    setPlain ("m" + b + "Depth", depth);
+    setPlain ("m" + b + "On", on);
+    curves[(size_t) other].setNodes (nodes);
+
+    selectedSlot.store (other);
+}
+
+void PumpKitProcessor::startWith (int type)
+{
+    setPlain ("m1Type", (float) type);
+    setPlain ("m1Depth", 100.0f);
+    setPlain ("m1On", 1.0f);
+    curves[0].setNodes (pump::defaultNodes (type));
+    selectedSlot.store (0);
+    started.store (true);
+}
+
+//==============================================================================
 void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::MidiBuffer& midi)
 {
     juce::ScopedNoDenormals noDenormals;
 
     const int numSamples = buffer.getNumSamples();
-    const int numCh = std::min (getMainBusNumInputChannels(), buffer.getNumChannels());
+    const int numCh = std::min ({ getMainBusNumInputChannels(), buffer.getNumChannels(), 2 });
     if (numCh <= 0 || numSamples <= 0)
     {
         midi.clear();
@@ -171,47 +295,38 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     const int mode       = (int) pMode->load();
     const int lengthIdx  = (int) pLength->load();
     const bool split     = pSplit->load() > 0.5f;
-    const int  srcChoice = (int) pSource->load();             // 0 sidechain input, 1 this track, 2..9 link A..H
-    const bool ownSource = srcChoice == 1;
-    const int  linkIn    = srcChoice >= 2 ? srcChoice - 2 : -1;
-    const int  sendTo    = (int) pSendTo->load() - 1;         // -1 = not sending
+    const bool ownSource = (int) pSource->load() == 1;
     const bool useHz     = pRateMode->load() > 0.5f;
-
-    // ---- send mode: this track only reports its level to a link channel and is not changed
-    if (sendTo >= 0)
-    {
-        linkTmp.resize ((size_t) numSamples);
-        float peak = 0.0f;
-        for (int i = 0; i < numSamples; ++i)
-        {
-            float l = 0.0f;
-            for (int c = 0; c < numCh; ++c)
-                l = std::max (l, std::abs (buffer.getReadPointer (c)[i]));
-            linkTmp[(size_t) i] = l;
-            peak = std::max (peak, l);
-        }
-        pump::linkSend (sendTo, linkTmp.data(), numSamples);
-        uiPhase.store (-1.0f);
-        uiSrcLevel.store (std::max (peak, uiSrcLevel.load() * 0.9f));
-        midi.clear();
-        return;
-    }
-
-    // ---- listen mode: fetch the levels sent by another PumpKit
-    const float* linkLevels = nullptr;
-    if (linkIn >= 0)
-    {
-        linkTmp.resize ((size_t) numSamples);
-        pump::linkReceive (linkIn, linkTmp.data(), numSamples);
-        linkLevels = linkTmp.data();
-    }
+    const bool chain     = pCombine->load() < 0.5f;
 
     if (useHz)
         hzPhase.setHz (pRateHz->load());
 
     mixSmooth.setTargetValue (pMix->load() * 0.01f);
-    smoother.setTimeMs (pSmooth->load());
     onset.setParams (pThreshold->load(), pRetrigger->load());
+
+    // ---- the effect modules: which are active, and reset what changed
+    int slotType[pump::kMaxSlots];
+    float slotDepth[pump::kMaxSlots];
+    bool anyVolumeSplit = false;
+    for (size_t s = 0; s < (size_t) pump::kMaxSlots; ++s)
+    {
+        int t = std::clamp ((int) pType[s]->load(), 0, pump::kNumFxTypes - 1);
+        if (pOn[s]->load() < 0.5f)
+            t = pump::fxOff;
+        slotType[s] = t;
+        slotDepth[s] = pDepth[s]->load() * 0.01f;
+
+        if (t != lastType[s])
+        {
+            lastType[s] = t;
+            fx[s].reset();
+            smoothers[s].reset (pump::fxNeutral (t));
+            crossovers[s].reset();
+        }
+        smoothers[s].setTimeMs (pSmooth->load());
+        anyVolumeSplit = anyVolumeSplit || (t == pump::fxVolume && split);
+    }
 
     if (mode != lastMode)
     {
@@ -276,19 +391,21 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
                 trigPos.push_back (meta.samplePosition);
     midi.clear();
 
-    // ---- band split setup
-    if (split)
+    // ---- band split setup (only the Volume modules use it)
+    if (anyVolumeSplit)
     {
         const float f = pFreq->load();
         if (f != lastCutoff)
         {
-            crossover.setCutoffFrequency (f);
+            for (auto& c : crossovers)
+                c.setCutoffFrequency (f);
             lastCutoff = f;
         }
         if (! wasSplit)
-            crossover.reset();
+            for (auto& c : crossovers)
+                c.reset();
     }
-    wasSplit = split;
+    wasSplit = anyVolumeSplit;
 
     // ---- main loop
     float srcPeak = 0.0f, uiPh = -1.0f;
@@ -300,23 +417,25 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     {
         // level of the sound on this track (before we change it) and of the sidechain input
         float own = 0.0f, scIn = 0.0f;
+        float in[2] = { 0.0f, 0.0f };
         for (int c = 0; c < numCh; ++c)
-            own = std::max (own, std::abs (buffer.getReadPointer (c)[i]));
+        {
+            in[c] = buffer.getReadPointer (c)[i];
+            own = std::max (own, std::abs (in[c]));
+        }
         for (int c = 0; c < scCh; ++c)
             scIn = std::max (scIn, std::abs (sc[c][i]));
 
-        const float srcLevel = linkLevels != nullptr ? linkLevels[i] : (ownSource ? own : scIn);   // what triggers the curve in Audio mode
+        const float srcLevel = ownSource ? own : scIn;   // what triggers the curve in Audio mode
         srcPeak = std::max (srcPeak, srcLevel);
 
-        float g = 1.0f;
-        uiPh = -1.0f;
-
+        // where we are in the cycle (-1 = nothing is playing, every effect rests)
+        float ph = -1.0f;
         const double hzP = useHz ? hzPhase.next() : 0.0;   // keeps the speed gliding in every mode
 
         if (mode == 0 && useHz) // Sync with Hz speed: runs at its own speed, always
         {
-            g = curve.eval ((float) hzP);
-            uiPh = (float) hzP;
+            ph = (float) hzP;
         }
         else if (mode == 0) // Sync: locked to the host's position
         {
@@ -331,8 +450,7 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
                     freePhase -= std::floor (freePhase);
                     p = freePhase;
                 }
-                g = curve.eval ((float) p);
-                uiPh = (float) p;
+                ph = (float) p;
             }
         }
         else
@@ -352,33 +470,87 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
                 ++triggers;
             }
 
-            g = oneShot.next (curve);
-            uiPh = oneShot.phase();
+            ph = oneShot.nextPhase();
         }
+        uiPh = ph;
 
-        const float gs  = smoother.process (g);
-        const float mix = mixSmooth.getNextValue();
-        const float eff = 1.0f - mix * (1.0f - gs);
+        // ---- run the modules: in a chain each one gets the result of the one before,
+        //      side by side each one gets the original and the results are averaged
+        float cur[2] = { in[0], in[1] };
+        float acc[2] = { 0.0f, 0.0f };
+        int active = 0;
 
-        float outAbs = 0.0f;
-        for (int c = 0; c < numCh; ++c)
+        for (size_t s = 0; s < (size_t) pump::kMaxSlots; ++s)
         {
-            float* d = buffer.getWritePointer (c);
-            const float x = d[i];
-            if (split)
+            const int t = slotType[s];
+            if (t == pump::fxOff)
+                continue;
+
+            const float v  = ph >= 0.0f ? curves[s].eval (ph) : pump::fxNeutral (t);
+            const float vs = smoothers[s].process (v);
+
+            float y[2] = { chain ? cur[0] : in[0], chain ? cur[1] : in[1] };
+
+            if (t == pump::fxVolume)
             {
-                float lo = 0.0f, hi = 0.0f;
-                crossover.processSample (c, x, lo, hi);
-                d[i] = lo * eff + hi;   // only the lows are ducked
+                const float eff = pump::fxEffective (t, vs, slotDepth[s]);
+                for (int c = 0; c < numCh; ++c)
+                {
+                    if (split)
+                    {
+                        float lo = 0.0f, hi = 0.0f;
+                        crossovers[s].processSample (c, y[c], lo, hi);
+                        y[c] = lo * eff + hi;   // only the lows are ducked
+                    }
+                    else
+                    {
+                        y[c] *= eff;
+                    }
+                }
             }
             else
             {
-                d[i] = x * eff;
+                fx[s].process (t, vs, slotDepth[s], y, numCh);
             }
-            outAbs = std::max (outAbs, std::abs (d[i]));
+
+            if (chain)
+            {
+                cur[0] = y[0];
+                cur[1] = y[1];
+            }
+            else
+            {
+                acc[0] += y[0];
+                acc[1] += y[1];
+            }
+            ++active;
         }
 
-        // feed the waveform display: remember the loudest level seen at this point of the cycle
+        float wet[2] = { in[0], in[1] };
+        if (active > 0)
+        {
+            if (chain)
+            {
+                wet[0] = cur[0];
+                wet[1] = cur[1];
+            }
+            else
+            {
+                wet[0] = acc[0] / (float) active;
+                wet[1] = acc[1] / (float) active;
+            }
+        }
+
+        const float mix = mixSmooth.getNextValue();
+        float outAbs = 0.0f;
+        for (int c = 0; c < numCh; ++c)
+        {
+            const float o = in[c] + mix * (wet[c] - in[c]);
+            buffer.getWritePointer (c)[i] = o;
+            outAbs = std::max (outAbs, std::abs (o));
+        }
+
+        // feed the waveform display: the loudest level seen at this point of the cycle (the last pass is shown)
         if (uiPh >= 0.0f)
         {
             const int bin = std::min (pump::kScopeBins - 1, (int) (uiPh * (float) pump::kScopeBins));
@@ -386,10 +558,9 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             if (bin != lastBin)
             {
                 lastBin = bin;
-                // fade what was there on the previous pass, so old audio disappears over time
-                scopeIn[b].store  (scopeIn[b].load  (std::memory_order_relaxed) * 0.85f, std::memory_order_relaxed);
-                scopeOut[b].store (scopeOut[b].load (std::memory_order_relaxed) * 0.85f, std::memory_order_relaxed);
-                scopeSc[b].store  (scopeSc[b].load  (std::memory_order_relaxed) * 0.85f, std::memory_order_relaxed);
+                scopeIn[b].store  (0.0f, std::memory_order_relaxed);   // a new pass starts here: drop the old one
+                scopeOut[b].store (0.0f, std::memory_order_relaxed);
+                scopeSc[b].store  (0.0f, std::memory_order_relaxed);
             }
             if (own     > scopeIn[b].load  (std::memory_order_relaxed)) scopeIn[b].store  (own,      std::memory_order_relaxed);
             if (outAbs  > scopeOut[b].load (std::memory_order_relaxed)) scopeOut[b].store (outAbs,   std::memory_order_relaxed);
@@ -416,9 +587,11 @@ juce::AudioProcessorEditor* PumpKitProcessor::createEditor()
 void PumpKitProcessor::getStateInformation (juce::MemoryBlock& destData)
 {
     auto state = apvts.copyState();
-    state.setProperty ("curve", juce::String (curve.toString()), nullptr);
+    for (int s = 0; s < pump::kMaxSlots; ++s)
+        state.setProperty ("curve" + juce::String (s), juce::String (curves[(size_t) s].toString()), nullptr);
     state.setProperty ("genre", genreIndex.load(), nullptr);
     state.setProperty ("preset", presetIndex.load(), nullptr);
+    state.setProperty ("started", started.load(), nullptr);
     if (auto xml = state.createXml())
         copyXmlToBinary (*xml, destData);
 }
@@ -432,14 +605,24 @@ void PumpKitProcessor::setStateInformation (const void* data, int sizeInBytes)
             auto tree = juce::ValueTree::fromXml (*xml);
             apvts.replaceState (tree);
 
-            if (tree.hasProperty ("curve"))
-                curve.fromString (tree["curve"].toString().toStdString());
+            for (int s = 0; s < pump::kMaxSlots; ++s)
+            {
+                const juce::String key = "curve" + juce::String (s);
+                if (tree.hasProperty (key))
+                    curves[(size_t) s].fromString (tree[key].toString().toStdString());
+                else if (s == 0 && tree.hasProperty ("curve"))   // projects from before the modules existed
+                    curves[0].fromString (tree["curve"].toString().toStdString());
+            }
 
             const int ng = pump::numGenres();
             const int g = juce::jlimit (0, ng - 1, (int) tree.getProperty ("genre", 0));
             const int np = (int) pump::genres()[(size_t) g].presets.size();
             genreIndex.store (g);
             presetIndex.store (juce::jlimit (0, np - 1, (int) tree.getProperty ("preset", 0)));
+
+            // an older project has no start screen to go through
+            started.store ((bool) tree.getProperty ("started", true));
+            selectedSlot.store (0);
         }
     }
 }

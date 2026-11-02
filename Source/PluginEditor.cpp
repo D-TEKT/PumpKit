@@ -79,6 +79,87 @@ CurveEditor::CurveEditor (PumpKitProcessor& p) : proc (p)
     startTimerHz (30);
 }
 
+pump::CurveTable& CurveEditor::curveRef() const
+{
+    return proc.curves[(size_t) juce::jlimit (0, pump::kMaxSlots - 1, proc.selectedSlot.load())];
+}
+
+int CurveEditor::slotType() const
+{
+    return (int) proc.apvts.getRawParameterValue ("m" + juce::String (proc.selectedSlot.load() + 1) + "Type")->load();
+}
+
+float CurveEditor::slotDepth() const
+{
+    return proc.apvts.getRawParameterValue ("m" + juce::String (proc.selectedSlot.load() + 1) + "Depth")->load() * 0.01f;
+}
+
+bool CurveEditor::magnetOn() const
+{
+    return proc.apvts.getRawParameterValue ("magnet")->load() > 0.5f;
+}
+
+// all vertical grid lines: beats (or quarters of the cycle) are strong, the Grid setting adds finer ones
+std::vector<CurveEditor::GridLine> CurveEditor::buildGrid() const
+{
+    const bool hz = proc.apvts.getRawParameterValue ("rateMode")->load() > 0.5f;
+    const double L = hz ? 4.0 : pump::lengthQuarters ((int) proc.apvts.getRawParameterValue ("length")->load());
+    const int divs[] = { 0, 2, 4, 8, 16, 32 };
+    const int n = divs[juce::jlimit (0, 5, (int) proc.apvts.getRawParameterValue ("gridDiv")->load())];
+
+    std::vector<GridLine> g;
+    auto put = [&g] (float x, bool major)
+    {
+        for (auto& l : g)
+            if (std::fabs (l.x - x) < 1.0e-4f) { l.major = l.major || major; return; }
+        g.push_back ({ x, major });
+    };
+
+    if (L >= 2.0 && std::fabs (L - std::round (L)) < 1.0e-6)
+        for (int k = 0; k <= (int) std::round (L); ++k) put ((float) ((double) k / L), true);   // one strong line per beat
+    else
+        for (int k = 0; k <= 4; ++k) put ((float) k * 0.25f, true);                              // quarters of the cycle
+
+    for (int k = 0; n > 0 && k <= n; ++k)
+        put ((float) k / (float) n, false);
+
+    std::sort (g.begin(), g.end(), [] (const GridLine& a, const GridLine& b) { return a.x < b.x; });
+    return g;
+}
+
+float CurveEditor::snapX (float x01, float, const juce::ModifierKeys& mods)
+{
+    snapShownX = -1.0f;
+    if (! magnetOn() || mods.isShiftDown())
+        return x01;
+
+    const float widthPx = plotArea().getWidth();
+    float best = x01, bestDist = 7.0f;   // pull radius in pixels
+    for (const auto& l : buildGrid())
+    {
+        const float d = std::fabs (l.x - x01) * widthPx;
+        if (d <= bestDist) { bestDist = d; best = l.x; snapShownX = l.x; }
+    }
+    return best;
+}
+
+float CurveEditor::snapY (float y01, const juce::ModifierKeys& mods)
+{
+    snapShownY = -1.0f;
+    if (! magnetOn() || mods.isShiftDown())
+        return y01;
+
+    const float heightPx = plotArea().getHeight();
+    float best = y01, bestDist = 7.0f;
+    for (int k = 0; k <= 4; ++k)
+    {
+        const float line = (float) k * 0.25f;
+        const float d = std::fabs (line - y01) * heightPx;
+        if (d <= bestDist) { bestDist = d; best = line; snapShownY = line; }
+    }
+    return best;
+}
+
 juce::Rectangle<float> CurveEditor::plotArea() const
 {
     auto area = getLocalBounds().toFloat().reduced (14.0f, 16.0f);
@@ -194,12 +275,55 @@ void CurveEditor::paint (juce::Graphics& g)
 
     const auto b = plotArea();
 
-    // grid
-    g.setColour (juce::Colours::white.withAlpha (0.06f));
-    for (int i = 0; i <= 4; ++i)
-        g.drawVerticalLine ((int) (b.getX() + b.getWidth() * (float) i / 4.0f), b.getY(), b.getBottom());
-    for (int i = 0; i <= 2; ++i)
-        g.drawHorizontalLine ((int) (b.getY() + b.getHeight() * (float) i / 2.0f), b.getX(), b.getRight());
+    // grid: strong lines on the beats, finer lines from the Grid setting, and quarter lines for the height
+    {
+        const int type = slotType();
+        const auto lines = buildGrid();
+        for (const auto& l : lines)
+        {
+            const float x = b.getX() + l.x * b.getWidth();
+            g.setColour (juce::Colours::white.withAlpha (l.major ? 0.14f : 0.055f));
+            g.drawVerticalLine ((int) x, b.getY(), b.getBottom());
+        }
+        for (int i = 0; i <= 4; ++i)
+        {
+            g.setColour (juce::Colours::white.withAlpha (i == 2 ? 0.10f : 0.05f));
+            g.drawHorizontalLine ((int) (b.getBottom() - b.getHeight() * (float) i * 0.25f), b.getX(), b.getRight());
+        }
+
+        // beat numbers along the top
+        const bool hz = proc.apvts.getRawParameterValue ("rateMode")->load() > 0.5f;
+        const double L = hz ? 4.0 : pump::lengthQuarters ((int) proc.apvts.getRawParameterValue ("length")->load());
+        g.setFont (10.5f);
+        g.setColour (kDim);
+        if (L >= 2.0 && std::fabs (L - std::round (L)) < 1.0e-6)
+        {
+            for (int k = 0; k < (int) std::round (L); ++k)
+                g.drawText (juce::String (k + 1), (int) (b.getX() + (float) (k / L) * b.getWidth()) + 3, 1, 24, 13,
+                            juce::Justification::centredLeft, false);
+        }
+        else
+        {
+            const char* q[] = { "0", "25%", "50%", "75%" };
+            for (int k = 0; k < 4; ++k)
+                g.drawText (q[k], (int) (b.getX() + (float) k * 0.25f * b.getWidth()) + 3, 1, 34, 13, juce::Justification::centredLeft, false);
+        }
+
+        // what the top and the bottom of the curve mean for this effect
+        g.setColour (kDim.withAlpha (0.8f));
+        g.drawText (pump::fxTopLabel (type), (int) b.getRight() - 124, (int) b.getY() + 2, 120, 13, juce::Justification::centredRight, false);
+        g.drawText (pump::fxBottomLabel (type), (int) b.getRight() - 124, (int) b.getBottom() - 15, 120, 13, juce::Justification::centredRight, false);
+        const char* mid = type == pump::fxPan ? "centre" : (type == pump::fxWidth ? "normal" : (type == pump::fxPitch ? "no change" : ""));
+        if (*mid)
+            g.drawText (mid, (int) b.getRight() - 124, (int) (b.getCentreY()) - 14, 120, 13, juce::Justification::centredRight, false);
+
+        // the line a point is currently stuck to
+        g.setColour (accent.withAlpha (0.55f));
+        if (snapShownX >= 0.0f)
+            g.drawVerticalLine ((int) (b.getX() + snapShownX * b.getWidth()), b.getY(), b.getBottom());
+        if (snapShownY >= 0.0f)
+            g.drawHorizontalLine ((int) (b.getBottom() - snapShownY * b.getHeight()), b.getX(), b.getRight());
+    }
 
     // waveforms: sound going in (dim), sound coming out (bright), what triggers the curve (genre colour, lighter)
     drawWave (g, proc.scopeIn,  b, juce::Colours::white.withAlpha (0.09f), juce::Colours::white.withAlpha (0.16f), 1.0f);
@@ -207,7 +331,7 @@ void CurveEditor::paint (juce::Graphics& g)
     drawWave (g, proc.scopeSc,  b, accent.brighter (0.7f).withAlpha (0.20f), accent.brighter (0.9f).withAlpha (0.95f), 1.6f);
 
     // curve
-    const auto nodes = proc.curve.getNodes();
+    const auto nodes = curveRef().getNodes();
 
     juce::Path line, fill;
     const int steps = std::max (2, (int) b.getWidth());
@@ -215,7 +339,7 @@ void CurveEditor::paint (juce::Graphics& g)
     {
         const float x01 = (float) s / (float) steps;
         const float px = b.getX() + x01 * b.getWidth();
-        const float py = b.getBottom() - proc.curve.eval (x01) * b.getHeight();
+        const float py = b.getBottom() - curveRef().eval (x01) * b.getHeight();
         if (s == 0)
         {
             line.startNewSubPath (px, py);
@@ -241,7 +365,7 @@ void CurveEditor::paint (juce::Graphics& g)
     if (ph >= 0.0f)
     {
         const float px = b.getX() + ph * b.getWidth();
-        const float py = b.getBottom() - proc.curve.eval (ph) * b.getHeight();
+        const float py = b.getBottom() - curveRef().eval (ph) * b.getHeight();
         g.setColour (juce::Colours::white.withAlpha (0.45f));
         g.drawVerticalLine ((int) px, b.getY(), b.getBottom());
         g.setColour (juce::Colours::white);
@@ -295,8 +419,8 @@ void CurveEditor::paint (juce::Graphics& g)
         {
             const auto& n = nodes[(size_t) shown.index];
             c = toScreen (n.x, n.y);
-            text = "time " + juce::String (juce::roundToInt (n.x * 100.0f)) + "%   volume "
-                 + juce::String (juce::roundToInt (n.y * 100.0f)) + "%";
+            text = "time " + juce::String (juce::roundToInt (n.x * 100.0f)) + "%   "
+                 + juce::String (pump::fxValueText (slotType(), n.y, slotDepth()));
         }
         else if (hasDot (nodes, (size_t) shown.index))
         {
@@ -308,7 +432,7 @@ void CurveEditor::paint (juce::Graphics& g)
 
         if (text.isNotEmpty())
         {
-            const float w = 150.0f, h = 20.0f;
+            const float w = 215.0f, h = 20.0f;
             float tx = c.x + 12.0f, ty = c.y - h - 8.0f;
             if (tx + w > (float) getWidth() - 4.0f) tx = c.x - w - 12.0f;
             if (ty < 4.0f) ty = c.y + 10.0f;
@@ -339,14 +463,14 @@ void CurveEditor::paint (juce::Graphics& g)
     legend (accent.brighter (0.9f), "trigger / sidechain");
 
     g.setColour (kDim);
-    g.drawText ("click = add point   drag = move   small dot = bend the line   right-click = delete / straighten",
+    g.drawText ("click = add point   drag = move (sticks to the grid)   Shift = free   dot = bend   right-click = delete",
                 getLocalBounds().reduced (16, 0).removeFromBottom (16).toFloat(),
                 juce::Justification::centredRight, false);
 }
 
 void CurveEditor::mouseMove (const juce::MouseEvent& e)
 {
-    const auto h = hitTest (e.position, proc.curve.getNodes());
+    const auto h = hitTest (e.position, curveRef().getNodes());
     if (h.kind != hovering.kind || h.index != hovering.index)
     {
         hovering = h;
@@ -365,15 +489,15 @@ void CurveEditor::mouseExit (const juce::MouseEvent&)
 
 void CurveEditor::mouseDown (const juce::MouseEvent& e)
 {
-    const auto nodes = proc.curve.getNodes();
+    const auto nodes = curveRef().getNodes();
     const auto hit = hitTest (e.position, nodes);
 
     if (e.mods.isPopupMenu() || e.mods.isCtrlDown())
     {
         if (hit.kind == Kind::point)
-            proc.curve.removeNode (hit.index);
+            curveRef().removeNode (hit.index);
         else if (hit.kind == Kind::bend)
-            proc.curve.setBend (hit.index, 0.0f);
+            curveRef().setBend (hit.index, 0.0f);
 
         dragging = {};
         hovering = {};
@@ -388,11 +512,13 @@ void CurveEditor::mouseDown (const juce::MouseEvent& e)
     else
     {
         const auto b = plotArea();
-        const float x = juce::jlimit (0.0f, 1.0f, (e.position.x - b.getX()) / b.getWidth());
+        float x = juce::jlimit (0.0f, 1.0f, (e.position.x - b.getX()) / b.getWidth());
         float y = juce::jlimit (0.0f, 1.0f, 1.0f - (e.position.y - b.getY()) / b.getHeight());
+        x = snapX (x, e.position.x, e.mods);
+        y = snapY (y, e.mods);
         if (y < 0.02f) y = 0.0f;
         if (y > 0.98f) y = 1.0f;
-        const int idx = proc.curve.addNode (x, y);
+        const int idx = curveRef().addNode (x, y);
         dragging = idx >= 0 ? Hit { Kind::point, idx } : Hit {};
     }
 
@@ -406,23 +532,25 @@ void CurveEditor::dragTo (const juce::MouseEvent& e)
         return;
 
     const auto b = plotArea();
-    const float x = juce::jlimit (0.0f, 1.0f, (e.position.x - b.getX()) / b.getWidth());
+    float x = juce::jlimit (0.0f, 1.0f, (e.position.x - b.getX()) / b.getWidth());
     float y = juce::jlimit (0.0f, 1.0f, 1.0f - (e.position.y - b.getY()) / b.getHeight());
 
     if (dragging.kind == Kind::point)
     {
+        x = snapX (x, e.position.x, e.mods);
+        y = snapY (y, e.mods);
         // snap to fully ducked / fully open when close (hold Shift to turn this off)
         if (! e.mods.isShiftDown())
         {
             if (y < 0.02f) y = 0.0f;
             if (y > 0.98f) y = 1.0f;
         }
-        proc.curve.moveNode (dragging.index, x, y);
+        curveRef().moveNode (dragging.index, x, y);
     }
     else
     {
         // the dot sits on the line, so dragging it up or down sets how far the middle is pushed
-        const auto nodes = proc.curve.getNodes();
+        const auto nodes = curveRef().getNodes();
         const size_t i = (size_t) dragging.index;
         if (i + 1 < nodes.size())
         {
@@ -430,7 +558,7 @@ void CurveEditor::dragTo (const juce::MouseEvent& e)
             float bend = y - lin;
             if (! e.mods.isShiftDown() && std::fabs (bend) < 0.02f)   // easy to get back to straight
                 bend = 0.0f;
-            proc.curve.setBend (dragging.index, bend);
+            curveRef().setBend (dragging.index, bend);
         }
     }
     repaint();
@@ -444,6 +572,7 @@ void CurveEditor::mouseDrag (const juce::MouseEvent& e)
 void CurveEditor::mouseUp (const juce::MouseEvent& e)
 {
     dragging = {};
+    snapShownX = snapShownY = -1.0f;
     mouseMove (e);
     repaint();
 }
@@ -537,34 +666,224 @@ void HelpPanel::paint (juce::Graphics& g)
     auto r = getLocalBounds().reduced (28, 22);
     g.setColour (accent);
     g.setFont (juce::FontOptions (20.0f, juce::Font::bold));
-    g.drawText ("Choosing the sidechain source", r.removeFromTop (30), juce::Justification::centredLeft);
+    g.drawText ("Sidechain in FL Studio, and effects", r.removeFromTop (30), juce::Justification::centredLeft);
     r.removeFromTop (6);
 
     g.setColour (kText);
     g.setFont (juce::FontOptions (14.0f));
     const juce::String text =
-        "FL Studio's own plugins (like Fruity Limiter) can list FL's mixer tracks. Plugins in the VST3 format cannot, "
-        "so PumpKit has its own way to choose the source, inside the plugin. It takes 4 steps:\n\n"
-        "1.  Put a PumpKit on the kick's mixer track. Set SEND (bottom right) to \"Send to A\". "
-        "The kick is not changed by it, it only reports its sound to channel A.\n"
-        "2.  Put another PumpKit on the track you want to duck (bass, pad...).\n"
-        "3.  On that one: Mode = Audio, TRIGGER FROM = \"Link A\".\n"
-        "4.  Play. The meter moves and the light flashes on every kick. Pick the same letter on both. "
-        "You can use up to 8 channels (A to H), one sender per letter.\n\n"
-        "Tip: if the pump feels a little late, put the kick on a lower-numbered mixer track than the bass, "
-        "or lower FL's buffer size.\n\n"
-        "Other ways: Mode Sync (follows the song tempo), Mode MIDI, TRIGGER FROM = This track, or FL's own routing "
-        "(right-click the send knob, \"Sidechain to this track\", then the wrapper's Processing page) with TRIGGER FROM = Sidechain.\n\n"
+        "FL Studio decides which mixer track feeds a plugin's sidechain, so this one step is done in FL (the same way as "
+        "with other plugins such as Kickstart). It takes 20 seconds:\n\n"
+        "1.  Put your kick on its own mixer track.\n"
+        "2.  Put PumpKit on the track of the sound you want to duck (bass, pad...).\n"
+        "3.  Click the kick's mixer track. Right-click the small send knob at the bottom of the bass track and choose "
+        "\"Sidechain to this track\".\n"
+        "4.  Open the PumpKit wrapper: click the gear icon at the top left of this window, then the Processing page. "
+        "Under Sidechain, make sure the kick's track is selected.\n"
+        "5.  Set Mode to Audio here. The meter at the bottom right moves and its light flashes on every kick.\n\n"
+        "No routing wanted?  Use Mode: Sync (follows the song tempo), Mode: MIDI, or Audio with "
+        "TRIGGER FROM = This track (listens to the sound on the track itself).\n\n"
+        "Effects: every tab is one effect with its own curve. Use + to add more (up to six). Chain = each effect works on the "
+        "result of the one before it (right-click a tab to change the order). Side by side = every effect works on the original "
+        "sound and the results are mixed together.\n\n"
         "Click anywhere to close this panel.";
     g.drawFittedText (text, r, juce::Justification::topLeft, 20, 1.0f);
 }
 
 //==============================================================================
+namespace
+{
+    const int kStartTypes[] = { pump::fxVolume, pump::fxFilter, pump::fxPan, pump::fxWidth, pump::fxDistortion, pump::fxPitch };
+}
+
+juce::Rectangle<float> StartScreen::tileRect (int index) const
+{
+    auto area = getLocalBounds().toFloat().reduced (40.0f, 0.0f);
+    area.removeFromTop (110.0f);
+    area.removeFromBottom (40.0f);
+    const float gap = 16.0f;
+    const float w = (area.getWidth() - gap * 2.0f) / 3.0f;
+    const float h = (area.getHeight() - gap) / 2.0f;
+    const int col = index % 3, row = index / 3;
+    return { area.getX() + (float) col * (w + gap), area.getY() + (float) row * (h + gap), w, h };
+}
+
+int StartScreen::tileAt (juce::Point<float> p) const
+{
+    for (int i = 0; i < 6; ++i)
+        if (tileRect (i).contains (p))
+            return i;
+    return -1;
+}
+
+void StartScreen::mouseMove (const juce::MouseEvent& e)
+{
+    const int t = tileAt (e.position);
+    if (t != hover)
+    {
+        hover = t;
+        setMouseCursor (t >= 0 ? juce::MouseCursor::PointingHandCursor : juce::MouseCursor::NormalCursor);
+        repaint();
+    }
+}
+
+void StartScreen::mouseDown (const juce::MouseEvent& e)
+{
+    const int t = tileAt (e.position);
+    if (t >= 0 && onPick)
+        onPick (kStartTypes[t]);
+}
+
+void StartScreen::paint (juce::Graphics& g)
+{
+    g.fillAll (kBackground);
+    juce::ColourGradient glow (accent.withAlpha (0.22f), (float) getWidth() * 0.5f, (float) getHeight() * 0.35f,
+                               accent.withAlpha (0.0f), 0.0f, 0.0f, true);
+    g.setGradientFill (glow);
+    g.fillRect (getLocalBounds());
+
+    g.setColour (kText);
+    g.setFont (juce::FontOptions (30.0f, juce::Font::bold));
+    g.drawText ("PUMPKIT", getLocalBounds().withHeight (70).withTrimmedTop (22), juce::Justification::centred);
+    g.setColour (accent);
+    g.fillRect ((float) getWidth() * 0.5f - 18.0f, 70.0f, 36.0f, 3.0f);
+    g.setColour (kDim);
+    g.setFont (juce::FontOptions (15.0f));
+    g.drawText ("What do you want to shape?  You can add more effects later with the + button.",
+                getLocalBounds().withTrimmedTop (80).withHeight (30), juce::Justification::centred);
+
+    for (int i = 0; i < 6; ++i)
+    {
+        const int type = kStartTypes[i];
+        const auto r = tileRect (i);
+        const bool over = hover == i;
+
+        g.setColour (kPanel.brighter (over ? 0.12f : 0.0f));
+        g.fillRoundedRectangle (r, 10.0f);
+        g.setColour (over ? accent : juce::Colours::white.withAlpha (0.10f));
+        g.drawRoundedRectangle (r.reduced (0.5f), 10.0f, over ? 2.0f : 1.0f);
+
+        // a small preview of this effect's starting curve
+        pump::CurveTable preview;
+        preview.setNodes (pump::defaultNodes (type));
+        auto pr = r.reduced (18.0f, 0.0f).withTrimmedTop (16.0f).withTrimmedBottom (r.getHeight() * 0.42f);
+        juce::Path line, fill;
+        for (int s = 0; s <= 80; ++s)
+        {
+            const float x01 = (float) s / 80.0f;
+            const float px = pr.getX() + x01 * pr.getWidth();
+            const float py = pr.getBottom() - preview.eval (x01) * pr.getHeight();
+            if (s == 0) { line.startNewSubPath (px, py); fill.startNewSubPath (px, pr.getBottom()); fill.lineTo (px, py); }
+            else        { line.lineTo (px, py); fill.lineTo (px, py); }
+        }
+        fill.lineTo (pr.getRight(), pr.getBottom());
+        fill.closeSubPath();
+        g.setColour (accent.withAlpha (over ? 0.22f : 0.12f));
+        g.fillPath (fill);
+        g.setColour (accent);
+        g.strokePath (line, juce::PathStrokeType (2.2f));
+
+        auto text = r.withTrimmedTop (r.getHeight() * 0.62f).reduced (14.0f, 0.0f);
+        g.setColour (kText);
+        g.setFont (juce::FontOptions (18.0f, juce::Font::bold));
+        g.drawText (pump::fxName (type), text.removeFromTop (26.0f), juce::Justification::centredLeft);
+        g.setColour (kDim);
+        g.setFont (juce::FontOptions (12.5f));
+        g.drawFittedText (pump::fxHint (type), text.toNearestInt(), juce::Justification::topLeft, 2);
+    }
+}
+
+//==============================================================================
+int TabStrip::slotType (int s) const
+{
+    return (int) proc.apvts.getRawParameterValue ("m" + juce::String (s + 1) + "Type")->load();
+}
+
+int TabStrip::slotAt (juce::Point<int> p) const
+{
+    int x = 0;
+    for (int s = 0; s < pump::kMaxSlots; ++s)
+    {
+        if (slotType (s) == pump::fxOff)
+            continue;
+        if (juce::Rectangle<int> (x, 0, kTabW, getHeight()).contains (p))
+            return s;
+        x += kTabW + 4;
+    }
+    return -1;
+}
+
+bool TabStrip::overAdd (juce::Point<int> p) const
+{
+    int n = 0;
+    for (int s = 0; s < pump::kMaxSlots; ++s)
+        if (slotType (s) != pump::fxOff)
+            ++n;
+    return n < pump::kMaxSlots && juce::Rectangle<int> (n * (kTabW + 4), 0, kAddW, getHeight()).contains (p);
+}
+
+void TabStrip::mouseDown (const juce::MouseEvent& e)
+{
+    const int s = slotAt (e.getPosition());
+    if (s >= 0)
+    {
+        if (onSelect) onSelect (s);
+        if ((e.mods.isPopupMenu() || e.mods.isCtrlDown()) && onMenu)
+            onMenu (s);
+    }
+    else if (overAdd (e.getPosition()) && onAdd)
+        onAdd();
+}
+
+void TabStrip::paint (juce::Graphics& g)
+{
+    const auto& all = pump::genres();
+    const auto accent = juce::Colour (all[(size_t) juce::jlimit (0, (int) all.size() - 1, proc.genreIndex.load())].colour);
+    const int selected = proc.selectedSlot.load();
+
+    int x = 0, n = 0;
+    for (int s = 0; s < pump::kMaxSlots; ++s)
+    {
+        const int t = slotType (s);
+        if (t == pump::fxOff)
+            continue;
+
+        const bool on = proc.apvts.getRawParameterValue ("m" + juce::String (s + 1) + "On")->load() > 0.5f;
+        const auto r = juce::Rectangle<float> ((float) x, 2.0f, (float) kTabW, (float) getHeight() - 2.0f);
+        const bool sel = s == selected;
+
+        g.setColour (sel ? accent.withAlpha (0.22f) : kPanel);
+        g.fillRoundedRectangle (r, 6.0f);
+        g.setColour (sel ? accent : juce::Colours::white.withAlpha (0.10f));
+        g.drawRoundedRectangle (r.reduced (0.5f), 6.0f, sel ? 1.8f : 1.0f);
+
+        g.setColour (on ? (sel ? juce::Colours::white : kText) : kDim.withAlpha (0.6f));
+        g.setFont (juce::FontOptions (13.5f, sel ? juce::Font::bold : juce::Font::plain));
+        g.drawText (juce::String (s + 1) + "  " + pump::fxName (t) + (on ? "" : "  (off)"), r.reduced (8.0f, 0.0f),
+                    juce::Justification::centredLeft, true);
+        x += kTabW + 4;
+        ++n;
+    }
+
+    if (n < pump::kMaxSlots)
+    {
+        const auto r = juce::Rectangle<float> ((float) x, 2.0f, (float) kAddW, (float) getHeight() - 2.0f);
+        g.setColour (kPanel);
+        g.fillRoundedRectangle (r, 6.0f);
+        g.setColour (juce::Colours::white.withAlpha (0.18f));
+        g.drawRoundedRectangle (r.reduced (0.5f), 6.0f, 1.0f);
+        g.setColour (kText);
+        g.setFont (juce::FontOptions (20.0f));
+        g.drawText ("+", r, juce::Justification::centred);
+    }
+}
+
+//==============================================================================
 PumpKitEditor::PumpKitEditor (PumpKitProcessor& p)
-    : juce::AudioProcessorEditor (&p), proc (p), curveEditor (p), sourceMeter (p)
+    : juce::AudioProcessorEditor (&p), proc (p), curveEditor (p), sourceMeter (p), tabs (p)
 {
     setLookAndFeel (&laf);
-    setSize (840, 580);
+    setSize (840, 628);
 
     addAndMakeVisible (curveEditor);
     addAndMakeVisible (sourceMeter);
@@ -587,8 +906,10 @@ PumpKitEditor::PumpKitEditor (PumpKitProcessor& p)
         lengthBox.addItemList (len->choices, 1);
     if (auto* src = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter ("scSource")))
         sourceBox.addItemList (src->choices, 1);
-    if (auto* sd = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter ("sendTo")))
-        sendBox.addItemList (sd->choices, 1);
+    if (auto* cb = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter ("combine")))
+        combineBox.addItemList (cb->choices, 1);
+    if (auto* gd = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter ("gridDiv")))
+        gridBox.addItemList (gd->choices, 1);
     if (auto* ru = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter ("rateMode")))
         rateUnitBox.addItemList (ru->choices, 1);
 
@@ -616,7 +937,16 @@ PumpKitEditor::PumpKitEditor (PumpKitProcessor& p)
     addAndMakeVisible (lengthBox);
     addAndMakeVisible (rateHzSlider);
     addAndMakeVisible (sourceBox);
-    addAndMakeVisible (sendBox);
+    addAndMakeVisible (combineBox);
+    addAndMakeVisible (gridBox);
+    addAndMakeVisible (magnetButton);
+    addAndMakeVisible (tabs);
+    setupLabel (combineLabel, "Combine", juce::Justification::centredRight);
+    setupLabel (gridLabel, "Grid", juce::Justification::centredRight);
+    combineBox.setTooltip ("Chain: each effect works on the result of the one before. Side by side: every effect works on the original sound and the results are mixed.");
+    gridBox.setTooltip ("Extra grid lines: how many parts the cycle is divided in");
+    magnetButton.setTooltip ("Points stick to grid lines when you drag them close (hold Shift for free movement)");
+    magnetButton.setColour (juce::ToggleButton::textColourId, kText);
     addAndMakeVisible (presetButton);
     addAndMakeVisible (prevButton);
     addAndMakeVisible (nextButton);
@@ -626,7 +956,9 @@ PumpKitEditor::PumpKitEditor (PumpKitProcessor& p)
     modeAtt     = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "mode", modeBox);
     lengthAtt   = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "length", lengthBox);
     sourceAtt   = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "scSource", sourceBox);
-    sendAtt     = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "sendTo", sendBox);
+    combineAtt  = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "combine", combineBox);
+    gridAtt     = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "gridDiv", gridBox);
+    magnetAtt   = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (proc.apvts, "magnet", magnetButton);
     rateUnitAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "rateMode", rateUnitBox);
     rateHzAtt   = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (proc.apvts, "rateHz", rateHzSlider);
 
@@ -635,6 +967,7 @@ PumpKitEditor::PumpKitEditor (PumpKitProcessor& p)
     splitAtt = std::make_unique<juce::AudioProcessorValueTreeState::ButtonAttachment> (proc.apvts, "bandSplit", splitButton);
 
     mixKnob.init (*this, "mix", "MIX");
+    depthKnob.init (*this, "m1Depth", "DEPTH");
     smoothKnob.init (*this, "smooth", "SMOOTH");
     freqKnob.init (*this, "splitFreq", "SPLIT FREQ");
     thresholdKnob.init (*this, "threshold", "THRESHOLD");
@@ -645,7 +978,22 @@ PumpKitEditor::PumpKitEditor (PumpKitProcessor& p)
     statusLabel.setFont (juce::FontOptions (12.5f));
     addAndMakeVisible (statusLabel);
 
+    tabs.onSelect = [this] (int s) { selectSlot (s); };
+    tabs.onAdd    = [this] { showAddMenu(); };
+    tabs.onMenu   = [this] (int s) { showSlotMenu (s); };
+
+    startScreen.onPick = [this] (int type)
+    {
+        proc.startWith (type);
+        startScreen.setVisible (false);
+        selectSlot (0);
+        curveEditor.repaint();
+    };
+    addChildComponent (startScreen);
+    startScreen.setVisible (! proc.started.load());
+
     showSelection (proc.genreIndex.load(), proc.presetIndex.load());
+    selectSlot (juce::jlimit (0, pump::kMaxSlots - 1, proc.selectedSlot.load()));
     applyTheme();
     updateRateControls();
 
@@ -685,7 +1033,7 @@ void PumpKitEditor::loadPreset (int genre, int preset)
     showSelection (genre, preset);
 
     const auto& def = pump::genres()[(size_t) proc.genreIndex.load()].presets[(size_t) proc.presetIndex.load()];
-    proc.curve.setNodes (def.nodes);
+    proc.curves[(size_t) juce::jlimit (0, pump::kMaxSlots - 1, proc.selectedSlot.load())].setNodes (def.nodes);
 
     // each preset was drawn for a certain note length. In Hz mode the speed is left alone
     // (so a preset never changes an automated or hand-set Hz value).
@@ -769,6 +1117,61 @@ void PumpKitEditor::showPresetMenu()
                         });
 }
 
+void PumpKitEditor::selectSlot (int slot)
+{
+    slot = juce::jlimit (0, pump::kMaxSlots - 1, slot);
+    proc.selectedSlot.store (slot);
+    if (slot != shownSlot)
+    {
+        shownSlot = slot;
+        depthKnob.attachment.reset();
+        depthKnob.attachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (
+            proc.apvts, "m" + juce::String (slot + 1) + "Depth", depthKnob.slider);
+    }
+    curveEditor.repaint();
+    tabs.repaint();
+}
+
+void PumpKitEditor::showAddMenu()
+{
+    juce::PopupMenu m;
+    m.addSectionHeader ("Add an effect");
+    for (int t = pump::fxVolume; t < pump::kNumFxTypes; ++t)
+        m.addItem (t, juce::String (pump::fxName (t)) + "   -   " + pump::fxHint (t));
+    m.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (tabs), [this] (int r)
+    {
+        if (r > 0)
+        {
+            proc.addModule (r);
+            selectSlot (proc.selectedSlot.load());
+        }
+    });
+}
+
+void PumpKitEditor::showSlotMenu (int slot)
+{
+    const bool on = proc.apvts.getRawParameterValue ("m" + juce::String (slot + 1) + "On")->load() > 0.5f;
+    const int active = proc.activeModules();
+    juce::PopupMenu m;
+    m.addItem (1, on ? "Bypass this effect" : "Switch this effect on");
+    m.addItem (2, "Move left (earlier in the chain)", slot > 0);
+    m.addItem (3, "Move right (later in the chain)", slot + 1 < active);
+    m.addSeparator();
+    m.addItem (4, "Remove this effect", active > 1);
+    m.showMenuAsync (juce::PopupMenu::Options(), [this, slot, on] (int r)
+    {
+        if (r == 1)
+        {
+            if (auto* prm = proc.apvts.getParameter ("m" + juce::String (slot + 1) + "On"))
+                prm->setValueNotifyingHost (on ? 0.0f : 1.0f);
+        }
+        else if (r == 2) proc.moveModule (slot, -1);
+        else if (r == 3) proc.moveModule (slot, 1);
+        else if (r == 4) proc.removeModule (slot);
+        selectSlot (proc.selectedSlot.load());
+    });
+}
+
 void PumpKitEditor::updateRateControls()
 {
     const bool hz = proc.apvts.getRawParameterValue ("rateMode")->load() > 0.5f;
@@ -779,13 +1182,15 @@ void PumpKitEditor::updateRateControls()
 void PumpKitEditor::applyTheme()
 {
     const auto accent = accentOf (proc);
-    for (auto* k : { &mixKnob, &smoothKnob, &freqKnob, &thresholdKnob, &retriggerKnob })
+    for (auto* k : { &mixKnob, &depthKnob, &smoothKnob, &freqKnob, &thresholdKnob, &retriggerKnob })
         k->slider.setColour (juce::Slider::rotarySliderFillColourId, accent);
 
     rateHzSlider.setColour (juce::Slider::trackColourId, accent.withAlpha (0.55f));
     splitButton.setColour (juce::ToggleButton::tickColourId, accent);
     presetButton.setColour (juce::TextButton::textColourOffId, accent.brighter (0.3f));
     helpPanel.accent = accent;
+    startScreen.accent = accent;
+    magnetButton.setColour (juce::ToggleButton::tickColourId, accent);
     repaint();
 }
 
@@ -839,11 +1244,21 @@ void PumpKitEditor::resized()
     presetButton.setBounds (top);
 
     r.removeFromTop (10);
+    auto tabRow = r.removeFromTop (30);
+    combineBox.setBounds (tabRow.removeFromRight (112));
+    combineLabel.setBounds (tabRow.removeFromRight (62));
+    tabRow.removeFromRight (10);
+    magnetButton.setBounds (tabRow.removeFromRight (76));
+    gridBox.setBounds (tabRow.removeFromRight (64));
+    gridLabel.setBounds (tabRow.removeFromRight (36));
+    tabs.setBounds (tabRow);
+    r.removeFromTop (8);
+
     auto knobRow = r.removeFromBottom (150);
     r.removeFromBottom (10);
     curveEditor.setBounds (r);
 
-    const int colW = knobRow.getWidth() / 7;
+    const int colW = knobRow.getWidth() / 8;
     auto place = [&] (Knob& k, juce::Rectangle<int> col)
     {
         k.label.setBounds (col.removeFromTop (18));
@@ -851,6 +1266,7 @@ void PumpKitEditor::resized()
     };
 
     place (mixKnob,       knobRow.removeFromLeft (colW));
+    place (depthKnob,     knobRow.removeFromLeft (colW));
     place (smoothKnob,    knobRow.removeFromLeft (colW));
     splitButton.setBounds (knobRow.removeFromLeft (colW).withSizeKeepingCentre (colW - 10, 28));
     place (freqKnob,      knobRow.removeFromLeft (colW));
@@ -861,12 +1277,11 @@ void PumpKitEditor::resized()
     sourceLabel.setBounds (src.removeFromTop (18));
     src.removeFromTop (8);
     sourceBox.setBounds (src.removeFromTop (28));
-    src.removeFromTop (8);
-    sourceMeter.setBounds (src.removeFromTop (20));
-    src.removeFromTop (8);
-    sendBox.setBounds (src.removeFromTop (26));
+    src.removeFromTop (14);
+    sourceMeter.setBounds (src.removeFromTop (22));
 
     helpPanel.setBounds (getLocalBounds().reduced (50, 70));
+    startScreen.setBounds (getLocalBounds());
 }
 
 void PumpKitEditor::timerCallback()
@@ -878,10 +1293,19 @@ void PumpKitEditor::timerCallback()
 
     thresholdKnob.slider.setEnabled (audio);
     retriggerKnob.slider.setEnabled (audio);
-    const bool sending = proc.apvts.getRawParameterValue ("sendTo")->load() > 0.5f;
-    sourceBox.setEnabled (audio && ! sending);
-    sendBox.setTooltip ("Send this track's sound to a link channel so another PumpKit can listen to it. This track is not changed.");
+    sourceBox.setEnabled (audio);
     freqKnob.slider.setEnabled (split);
+
+    // follow the selected module (it can change when a project loads, or from the tab strip)
+    if (proc.selectedSlot.load() != shownSlot)
+        selectSlot (proc.selectedSlot.load());
+    tabs.repaint();
+    if (startScreen.isVisible() == proc.started.load())
+        startScreen.setVisible (! proc.started.load());
+    {
+        const int selType = (int) proc.apvts.getRawParameterValue ("m" + juce::String (shownSlot + 1) + "Type")->load();
+        splitButton.setEnabled (selType == pump::fxVolume);
+    }
     updateRateControls();
 
     // follow the preset button when a project loads while the window is open
@@ -892,24 +1316,18 @@ void PumpKitEditor::timerCallback()
     }
 
     const bool signal = proc.uiSrcLevel.load() > 0.002f;
-    const int srcChoice = (int) proc.apvts.getRawParameterValue ("scSource")->load();
     const bool hz = proc.apvts.getRawParameterValue ("rateMode")->load() > 0.5f;
 
-    if (sending)
-        statusLabel.setText ("Sending to " + sendBox.getText().fromFirstOccurrenceOf ("Send to ", false, false)
-                             + ": this track is not changed", juce::dontSendNotification);
-    else if (mode == 0)
+    if (mode == 0)
         statusLabel.setText (hz ? "Sync: runs at the Hz speed while playing" : "Sync: follows the host tempo while playing",
                              juce::dontSendNotification);
     else if (mode == 1)
         statusLabel.setText ("MIDI: every note-on triggers the curve", juce::dontSendNotification);
     else if (signal)
         statusLabel.setText (own ? "Audio: listening to the sound on this track"
-                                 : (srcChoice >= 2 ? "Audio: receiving " + sourceBox.getText() : juce::String ("Audio: sidechain signal detected")),
-                             juce::dontSendNotification);
+                                 : "Audio: sidechain signal detected", juce::dontSendNotification);
     else
         statusLabel.setText (own ? "Audio: no sound on this track yet"
-                                 : (srcChoice >= 2 ? "Audio: nothing arriving on " + sourceBox.getText() + ". Is a PumpKit on the kick set to Send?"
-                                                   : juce::String ("Audio: no sidechain signal yet. Click ? for setup help")),
+                                 : "Audio: no sidechain signal yet. Click ? for the 20-second FL setup",
                              juce::dontSendNotification);
 }

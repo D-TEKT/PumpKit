@@ -454,6 +454,17 @@ public:
     void stop()                      { active = false; lastPhase = -1.0f; }
     float phase() const              { return lastPhase; }
 
+    // advances by one sample and returns the position in the cycle (0..1), or -1 when idle
+    float nextPhase()
+    {
+        if (! active) { lastPhase = -1.0f; return -1.0f; }
+        const double x = elapsed / length;
+        if (x >= 1.0) { stop(); return -1.0f; }
+        elapsed += 1.0;
+        lastPhase = (float) x;
+        return lastPhase;
+    }
+
     float next (const CurveTable& curve)
     {
         if (! active) { lastPhase = -1.0f; return 1.0f; }
@@ -610,6 +621,231 @@ private:
     float threshold = 0.06f;
     float ratio = 1.8f;
     int holdSamples = 4410, holdLeft = 0;
+};
+
+
+//==============================================================================
+// Effect modules: every module shapes one thing with its own curve.
+enum FxType { fxOff = 0, fxVolume, fxFilter, fxPan, fxWidth, fxDistortion, fxPitch, kNumFxTypes };
+constexpr int kMaxSlots = 6;
+
+inline const char* fxName (int t)
+{
+    static const char* n[kNumFxTypes] = { "Off", "Volume", "Filter", "Pan", "Width", "Distortion", "Pitch" };
+    return n[std::clamp (t, 0, kNumFxTypes - 1)];
+}
+
+inline const char* fxHint (int t)
+{
+    switch (t)
+    {
+        case fxVolume:     return "Sidechain pumping and gating";
+        case fxFilter:     return "Low-pass cutoff opens and closes";
+        case fxPan:        return "Moves the sound left and right";
+        case fxWidth:      return "Stereo width, from mono to extra wide";
+        case fxDistortion: return "Amount of drive follows the curve";
+        case fxPitch:      return "Pitch dives and risers (up to 12 semitones)";
+        default:           return "";
+    }
+}
+
+// the curve height that leaves the sound unchanged (used while nothing is playing)
+inline float fxNeutral (int t)
+{
+    switch (t)
+    {
+        case fxVolume: case fxFilter: return 1.0f;
+        case fxPan: case fxWidth: case fxPitch: return 0.5f;
+        default: return 0.0f;
+    }
+}
+
+// what the top and the bottom of the curve mean
+inline const char* fxTopLabel (int t)
+{
+    static const char* n[kNumFxTypes] = { "", "full volume", "open", "right", "wide", "max drive", "up" };
+    return n[std::clamp (t, 0, kNumFxTypes - 1)];
+}
+inline const char* fxBottomLabel (int t)
+{
+    static const char* n[kNumFxTypes] = { "", "silent", "closed", "left", "mono", "clean", "down" };
+    return n[std::clamp (t, 0, kNumFxTypes - 1)];
+}
+
+// the curve height after the Depth knob is applied
+inline float fxEffective (int t, float v, float depth)
+{
+    switch (t)
+    {
+        case fxVolume: case fxFilter: return 1.0f - depth * (1.0f - v);
+        case fxPan: case fxWidth: case fxPitch: return 0.5f + depth * (v - 0.5f);
+        default: return depth * v;
+    }
+}
+
+inline std::string fxValueText (int t, float v, float depth)
+{
+    char b[64];
+    const float e = fxEffective (t, v, depth);
+    switch (t)
+    {
+        case fxVolume:
+            std::snprintf (b, sizeof b, "volume %d%%", (int) std::lround (e * 100.0f)); break;
+        case fxFilter:
+        {
+            const float fc = 20.0f * std::pow (1000.0f, e);
+            if (fc >= 1000.0f) std::snprintf (b, sizeof b, "cutoff %.1f kHz", fc / 1000.0f);
+            else               std::snprintf (b, sizeof b, "cutoff %d Hz", (int) std::lround (fc));
+            break;
+        }
+        case fxPan:
+        {
+            const int p = (int) std::lround ((e * 2.0f - 1.0f) * 100.0f);
+            if (p == 0) std::snprintf (b, sizeof b, "pan centre");
+            else        std::snprintf (b, sizeof b, "pan %d%% %s", std::abs (p), p < 0 ? "left" : "right");
+            break;
+        }
+        case fxWidth:
+            std::snprintf (b, sizeof b, "width %d%%", (int) std::lround (e * 200.0f)); break;
+        case fxDistortion:
+            std::snprintf (b, sizeof b, "drive %d%%", (int) std::lround (e * 100.0f)); break;
+        case fxPitch:
+            std::snprintf (b, sizeof b, "pitch %+.1f st", (e * 2.0f - 1.0f) * 12.0f); break;
+        default: b[0] = 0;
+    }
+    return b;
+}
+
+//------------------------------------------------------------------------------
+// The sound processing of the non-volume modules (volume is done by the plugin itself, because
+// it can also work on the low frequencies only).
+class FxProcessor
+{
+public:
+    static constexpr int kPitchBuf = 1 << 15;
+
+    void prepare (double sr)
+    {
+        sampleRate = sr;
+        windowSamples = std::clamp (0.04 * sr, 64.0, (double) kPitchBuf / 4.0);
+        for (auto& b : buf) b.assign ((size_t) kPitchBuf, 0.0f);
+        reset();
+    }
+
+    void reset()
+    {
+        for (int c = 0; c < 2; ++c) { ic1[c] = ic2[c] = 0.0f; std::fill (buf[c].begin(), buf[c].end(), 0.0f); }
+        wpos = 0;
+        phi = 0.0;
+        lastEff = -1.0f;
+    }
+
+    // process one frame in place. x[0..n-1] = channels, v = curve value after smoothing, depth 0..1
+    void process (int type, float v, float depth, float* x, int n)
+    {
+        const float e = fxEffective (type, v, depth);
+        switch (type)
+        {
+            case fxFilter:     filter (e, x, n); break;
+            case fxPan:        pan (e, x, n); break;
+            case fxWidth:      width (e, x, n); break;
+            case fxDistortion: distort (e, x, n); break;
+            case fxPitch:      pitch (e, x, n); break;
+            default: break;
+        }
+    }
+
+private:
+    void filter (float e, float* x, int n)
+    {
+        if (e != lastEff)
+        {
+            lastEff = e;
+            double fc = 20.0 * std::pow (1000.0, (double) e);
+            fc = std::min (fc, 0.45 * sampleRate);
+            const double g = std::tan (3.14159265358979323846 * fc / sampleRate);
+            const double k = 1.0;
+            a1 = (float) (1.0 / (1.0 + g * (g + k)));
+            a2 = (float) (g * a1);
+            a3 = (float) (g * a2);
+        }
+        for (int c = 0; c < n; ++c)
+        {
+            const float v3 = x[c] - ic2[c];
+            const float v1 = a1 * ic1[c] + a2 * v3;
+            const float v2 = ic2[c] + a2 * ic1[c] + a3 * v3;
+            ic1[c] = 2.0f * v1 - ic1[c];
+            ic2[c] = 2.0f * v2 - ic2[c];
+            x[c] = v2;
+        }
+    }
+
+    static void pan (float e, float* x, int n)
+    {
+        if (n < 2) return;
+        const float theta = (e * 2.0f - 1.0f + 1.0f) * 0.78539816f;   // 0..pi/2
+        x[0] *= std::cos (theta) * 1.41421356f;
+        x[1] *= std::sin (theta) * 1.41421356f;
+    }
+
+    static void width (float e, float* x, int n)
+    {
+        if (n < 2) return;
+        const float w = e * 2.0f;                                     // 0 = mono, 1 = normal, 2 = extra wide
+        const float m = 0.5f * (x[0] + x[1]), s = 0.5f * (x[0] - x[1]) * w;
+        x[0] = m + s;
+        x[1] = m - s;
+    }
+
+    static void distort (float e, float* x, int n)
+    {
+        if (e <= 0.0001f) return;
+        const float pre = 1.0f + 30.0f * e;
+        const float comp = std::pow (pre, -0.4f);
+        const float a = std::min (1.0f, e * 10.0f);
+        for (int c = 0; c < n; ++c)
+            x[c] += (std::tanh (pre * x[c]) * comp - x[c]) * a;
+    }
+
+    void pitch (float e, float* x, int n)
+    {
+        const float semis = (e * 2.0f - 1.0f) * 12.0f;
+        const int mask = kPitchBuf - 1;
+        for (int c = 0; c < n; ++c)
+            buf[c][(size_t) (wpos & mask)] = x[c];
+
+        const double r = std::pow (2.0, (double) semis / 12.0);
+        phi += (1.0 - r) / windowSamples;
+        phi -= std::floor (phi);
+
+        const float amount = std::min (1.0f, std::fabs (semis) / 0.15f);   // fades to the clean sound at 0 semitones
+        if (amount > 0.0f)
+        {
+            const double u[2] = { phi, phi + 0.5 - std::floor (phi + 0.5) };
+            for (int c = 0; c < n; ++c)
+            {
+                float y = 0.0f;
+                for (int t = 0; t < 2; ++t)
+                {
+                    const double d = u[t] * windowSamples + 2.0;
+                    const double rp = (double) wpos - d;
+                    const long i0 = (long) std::floor (rp);
+                    const float fr = (float) (rp - (double) i0);
+                    const float a = buf[c][(size_t) (i0 & mask)], b = buf[c][(size_t) ((i0 + 1) & mask)];
+                    const float s = std::sin (3.14159265f * (float) u[t]);
+                    y += (a + (b - a) * fr) * s * s;
+                }
+                x[c] += (y - x[c]) * amount;
+            }
+        }
+        ++wpos;
+    }
+
+    double sampleRate = 44100.0, windowSamples = 1764.0, phi = 0.0;
+    std::array<std::vector<float>, 2> buf;
+    long wpos = 0;
+    float ic1[2] = { 0, 0 }, ic2[2] = { 0, 0 };
+    float a1 = 0.0f, a2 = 0.0f, a3 = 0.0f, lastEff = -1.0f;
 };
 
 } // namespace pump

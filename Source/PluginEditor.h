@@ -41,6 +41,15 @@ public:
     void mouseExit (const juce::MouseEvent&) override;
 
 private:
+    pump::CurveTable& curveRef() const;
+    int slotType() const;
+    float slotDepth() const;
+    struct GridLine { float x; bool major; };
+    std::vector<GridLine> buildGrid() const;
+    bool magnetOn() const;
+    float snapX (float x01, float px, const juce::ModifierKeys&);
+    float snapY (float y01, const juce::ModifierKeys&);
+
     enum class Kind { none, point, bend };
     struct Hit { Kind kind = Kind::none; int index = -1; };
 
@@ -56,6 +65,7 @@ private:
 
     PumpKitProcessor& proc;
     Hit dragging, hovering;
+    float snapShownX = -1.0f, snapShownY = -1.0f;   // grid lines the point is currently stuck to
 };
 
 //==============================================================================
@@ -73,6 +83,47 @@ public:
     void paint (juce::Graphics&) override;
     void mouseDown (const juce::MouseEvent&) override { setVisible (false); }
     juce::Colour accent { 0xffff3b3b };
+};
+
+//==============================================================================
+// The start screen: pick what you want to shape
+class StartScreen : public juce::Component
+{
+public:
+    std::function<void (int)> onPick;
+
+    void paint (juce::Graphics&) override;
+    void mouseDown (const juce::MouseEvent&) override;
+    void mouseMove (const juce::MouseEvent&) override;
+    void mouseExit (const juce::MouseEvent&) override { hover = -1; repaint(); }
+    juce::Colour accent { 0xffff3b3b };
+
+private:
+    juce::Rectangle<float> tileRect (int index) const;
+    int tileAt (juce::Point<float>) const;
+    int hover = -1;
+};
+
+//==============================================================================
+// The row of tabs, one for every effect module
+class TabStrip : public juce::Component
+{
+public:
+    explicit TabStrip (PumpKitProcessor& p) : proc (p) {}
+
+    std::function<void (int)> onSelect;            // slot
+    std::function<void()> onAdd;                   // the + button
+    std::function<void (int)> onMenu;              // right-click on a slot
+
+    void paint (juce::Graphics&) override;
+    void mouseDown (const juce::MouseEvent&) override;
+
+private:
+    static constexpr int kTabW = 92, kAddW = 30;
+    int slotAt (juce::Point<int>) const;
+    bool overAdd (juce::Point<int>) const;
+    int slotType (int s) const;
+    PumpKitProcessor& proc;
 };
 
 //==============================================================================
@@ -94,6 +145,9 @@ private:
     void showPresetMenu();
     void updateRateControls();
     void applyTheme();
+    void selectSlot (int slot);
+    void showAddMenu();
+    void showSlotMenu (int slot);
 
     struct Knob
     {
@@ -109,19 +163,21 @@ private:
 
     CurveEditor curveEditor;
     SourceMeter sourceMeter;
+    TabStrip tabs;
     HelpPanel helpPanel;
-    juce::ComboBox modeBox, lengthBox, rateUnitBox, sourceBox, sendBox;
+    StartScreen startScreen;
+    juce::ComboBox modeBox, lengthBox, rateUnitBox, sourceBox, combineBox, gridBox;
     juce::TextButton presetButton, prevButton { "<" }, nextButton { ">" }, helpButton { "?" };
     juce::Slider rateHzSlider;
-    juce::Label modeLabel, lengthLabel, genreLabel, sourceLabel, statusLabel;
-    juce::ToggleButton splitButton { "Band Split" };
-    Knob mixKnob, smoothKnob, freqKnob, thresholdKnob, retriggerKnob;
+    juce::Label modeLabel, lengthLabel, genreLabel, sourceLabel, statusLabel, combineLabel, gridLabel;
+    juce::ToggleButton splitButton { "Band Split" }, magnetButton { "Magnet" };
+    Knob mixKnob, depthKnob, smoothKnob, freqKnob, thresholdKnob, retriggerKnob;
 
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> modeAtt, lengthAtt, sourceAtt, rateUnitAtt, sendAtt;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> modeAtt, lengthAtt, sourceAtt, rateUnitAtt, combineAtt, gridAtt;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> rateHzAtt;
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> splitAtt;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> splitAtt, magnetAtt;
 
-    int shownGenre = -1, shownPreset = -1;
+    int shownGenre = -1, shownPreset = -1, shownSlot = -1;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PumpKitEditor)
 };

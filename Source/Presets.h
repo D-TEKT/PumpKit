@@ -140,6 +140,21 @@ inline NodeList sineS (float lo, float hi)
     return n;
 }
 
+
+// the starting curve of each effect module (curve height meaning depends on the effect)
+inline NodeList defaultNodes (int type)
+{
+    switch (type)
+    {
+        case fxFilter:     return pumpS (0.10f, 0.60f, 0.15f);                                   // closes on the hit, opens again
+        case fxPan:        return { { 0.0f, 0.5f, 0.0f }, { 0.25f, 1.0f, 0.0f }, { 0.75f, 0.0f, 0.0f }, { 1.0f, 0.5f, 0.0f } };
+        case fxWidth:      return { { 0.0f, 0.5f, 0.0f }, { 0.30f, 1.0f, 0.0f }, { 1.0f, 0.5f, 0.0f } };
+        case fxDistortion: return { { 0.0f, 1.0f, 0.0f }, { 0.50f, 0.0f, 0.10f }, { 1.0f, 0.0f, 0.0f } };
+        case fxPitch:      return { { 0.0f, 0.75f, 0.0f }, { 0.35f, 0.5f, 0.10f }, { 1.0f, 0.5f, 0.0f } };   // dives down after the hit
+        default:           return holdS (0.0f, 0.08f, 0.55f, 0.15f);
+    }
+}
+
 //------------------------------------------------------------------------------
 inline const std::vector<GenreDef>& genres()
 {

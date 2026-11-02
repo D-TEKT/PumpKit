@@ -8,7 +8,6 @@
 
 #include "PumpEngine.h"
 #include "Presets.h"
-#include "LinkBus.h"
 
 class PumpKitProcessor : public juce::AudioProcessor
 {
@@ -41,7 +40,11 @@ public:
 
     // shared with the editor
     juce::AudioProcessorValueTreeState apvts;
-    pump::CurveTable curve;
+    std::array<pump::CurveTable, pump::kMaxSlots> curves;   // one curve for every effect module
+    pump::CurveTable& curve = curves[0];                    // the first module's curve (kept for convenience)
+
+    std::atomic<int>  selectedSlot { 0 };      // which module the editor is showing
+    std::atomic<bool> started { false };       // the start screen has been passed
 
     std::atomic<int> genreIndex  { 0 };     // which preset group is selected (sets the colour)
     std::atomic<int> presetIndex { 0 };
@@ -50,11 +53,21 @@ public:
     std::atomic<float> uiSrcLevel { 0.0f };  // level of the trigger source (sidechain or own sound), slowly falling
     std::atomic<int>   trigCount  { 0 };     // goes up by one every time the curve is triggered
 
+    // module management (call from the editor / message thread)
+    int  activeModules() const;
+    int  addModule (int type);              // returns the slot it went into, or -1 if all six are used
+    void removeModule (int slot);
+    void moveModule (int slot, int delta);  // changes the order, which matters in a chain
+    void startWith (int type);              // the start screen: first module + leave the start screen
+
     // Waveform display: peak level of the sound at each position in the cycle
     std::array<std::atomic<float>, pump::kScopeBins> scopeIn, scopeOut, scopeSc;
 
 private:
     static juce::AudioProcessorValueTreeState::ParameterLayout createLayout();
+    void setPlain (const juce::String& id, float value);
+    float getPlain (const juce::String& id) const;
+    void copyModule (int from, int to);
 
     std::atomic<float>* pMode      = nullptr;
     std::atomic<float>* pLength    = nullptr;
@@ -67,7 +80,8 @@ private:
     std::atomic<float>* pSource    = nullptr;
     std::atomic<float>* pRateMode  = nullptr;
     std::atomic<float>* pRateHz    = nullptr;
-    std::atomic<float>* pSendTo    = nullptr;
+    std::atomic<float>* pCombine   = nullptr;
+    std::array<std::atomic<float>*, pump::kMaxSlots> pType {}, pDepth {}, pOn {};
 
     double sampleRate = 44100.0;
     double lastBpm = 120.0;
@@ -80,11 +94,12 @@ private:
 
     pump::OneShot oneShot;
     pump::OnsetDetector onset;
-    pump::GainSmoother smoother;
     juce::SmoothedValue<float> mixSmooth;
-    juce::dsp::LinkwitzRileyFilter<float> crossover;
+    std::array<juce::dsp::LinkwitzRileyFilter<float>, pump::kMaxSlots> crossovers;
+    std::array<pump::FxProcessor, pump::kMaxSlots> fx;
+    std::array<pump::GainSmoother, pump::kMaxSlots> smoothers;
+    std::array<int, pump::kMaxSlots> lastType {};
     std::vector<int> trigPos;
-    std::vector<float> linkTmp;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PumpKitProcessor)
 };
