@@ -1,0 +1,35 @@
+name: Build PumpKit (Windows VST3)
+
+on:
+  push:
+  workflow_dispatch:
+
+jobs:
+  build:
+    runs-on: windows-latest
+    steps:
+      - name: Get the code
+        uses: actions/checkout@v4
+
+      - name: Configure (64-bit, runtime built in so no extra installs are needed)
+        shell: pwsh
+        run: cmake -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_MSVC_RUNTIME_LIBRARY=MultiThreaded
+
+      - name: Build
+        shell: pwsh
+        run: cmake --build build --config Release --parallel
+
+      - name: Find and zip the plugin
+        shell: pwsh
+        run: |
+          $plugin = Get-ChildItem -Path build -Recurse -Directory -Filter 'PumpKit.vst3' | Select-Object -First 1
+          if (-not $plugin) { throw "PumpKit.vst3 was not built" }
+          Write-Host "Found: $($plugin.FullName)"
+          Get-ChildItem -Path $plugin.FullName -Recurse -File | ForEach-Object { Write-Host $_.FullName }
+          Compress-Archive -Path $plugin.FullName -DestinationPath PumpKit-VST3-Windows.zip
+
+      - name: Upload
+        uses: actions/upload-artifact@v4
+        with:
+          name: PumpKit-VST3-Windows
+          path: PumpKit-VST3-Windows.zip
