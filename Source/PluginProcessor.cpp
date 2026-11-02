@@ -64,6 +64,17 @@ juce::AudioProcessorValueTreeState::ParameterLayout PumpKitProcessor::createLayo
     layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "scSource", 1 }, "Trigger From",
                                                         StringArray { "Sidechain", "This track" }, 0));
 
+    // Speed: in note lengths (follows the song tempo) or in Hz (free speed, easy to automate)
+    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "rateMode", 1 }, "Rate Unit",
+                                                        StringArray { "Beats", "Hz" }, 0));
+
+    NormalisableRange<float> rateRange (pump::kMinHz, pump::kMaxHz, 0.01f);
+    rateRange.setSkewForCentre (3.0f);
+    layout.add (std::make_unique<AudioParameterFloat> (
+        ParameterID { "rateHz", 1 }, "Rate (Hz)", rateRange, 2.6f,
+        AudioParameterFloatAttributes().withStringFromValueFunction ([] (float v, int) { return juce::String (v, 2) + " Hz"; })
+                                       .withValueFromStringFunction (parseNumber)));
+
     return layout;
 }
 
@@ -85,6 +96,8 @@ PumpKitProcessor::PumpKitProcessor()
     pThreshold = apvts.getRawParameterValue ("threshold");
     pRetrigger = apvts.getRawParameterValue ("retrigger");
     pSource    = apvts.getRawParameterValue ("scSource");
+    pRateMode  = apvts.getRawParameterValue ("rateMode");
+    pRateHz    = apvts.getRawParameterValue ("rateHz");
 
     for (auto* arr : { &scopeIn, &scopeOut, &scopeSc })
         for (auto& v : *arr)
@@ -131,6 +144,8 @@ void PumpKitProcessor::prepareToPlay (double sr, int samplesPerBlock)
 
     freePhase = 0.0;
     lastMode = -1;
+    wasPlaying = false;
+    hzPhase.prepare (sr, pRateHz->load());
 }
 
 //==============================================================================
@@ -150,6 +165,10 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     const int lengthIdx  = (int) pLength->load();
     const bool split     = pSplit->load() > 0.5f;
     const bool ownSource = pSource->load() > 0.5f;
+    const bool useHz     = pRateMode->load() > 0.5f;
+
+    if (useHz)
+        hzPhase.setHz (pRateHz->load());
 
     mixSmooth.setTargetValue (pMix->load() * 0.01f);
     smoother.setTimeMs (pSmooth->load());
@@ -199,9 +218,15 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     bpm = std::clamp (bpm, 20.0, 999.0);
     lastBpm = bpm;
 
+    // with Hz speed the song starts the cycle over when playback starts
+    if (useHz && playing && ! wasPlaying)
+        hzPhase.restart();
+    wasPlaying = playing;
+
     const double lenQ       = pump::lengthQuarters (lengthIdx);
     const double qps        = bpm / 60.0 / sampleRate;            // quarter notes per sample
-    const double lenSamples = lenQ * 60.0 / bpm * sampleRate;
+    const double lenSamples = useHz ? sampleRate / (double) hzPhase.currentHz()
+                                    : lenQ * 60.0 / bpm * sampleRate;
     oneShot.setLengthSamples (lenSamples);
 
     // ---- MIDI triggers: remember where each note-on lands in this block
@@ -247,7 +272,14 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
         float g = 1.0f;
         uiPh = -1.0f;
 
-        if (mode == 0) // Sync: locked to the host's position
+        const double hzP = useHz ? hzPhase.next() : 0.0;   // keeps the speed gliding in every mode
+
+        if (mode == 0 && useHz) // Sync with Hz speed: runs at its own speed, always
+        {
+            g = curve.eval ((float) hzP);
+            uiPh = (float) hzP;
+        }
+        else if (mode == 0) // Sync: locked to the host's position
         {
             if (playing)
             {

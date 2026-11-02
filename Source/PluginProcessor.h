@@ -63,11 +63,15 @@ private:
     std::atomic<float>* pThreshold = nullptr;
     std::atomic<float>* pRetrigger = nullptr;
     std::atomic<float>* pSource    = nullptr;
+    std::atomic<float>* pRateMode  = nullptr;
+    std::atomic<float>* pRateHz    = nullptr;
 
     double sampleRate = 44100.0;
     double lastBpm = 120.0;
     double freePhase = 0.0;
     int lastMode = -1;
+    bool wasPlaying = false;
+    pump::HzPhase hzPhase;
     bool wasSplit = false;
     float lastCutoff = -1.0f;
 

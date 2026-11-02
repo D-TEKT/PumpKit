@@ -466,9 +466,103 @@ void PumpKitEditor::Knob::init (PumpKitEditor& owner, const juce::String& paramI
     attachment = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (owner.proc.apvts, paramId, slider);
 }
 
+namespace
+{
+    struct MenuEntry { int genre; int preset; };
+
+    // The order the presets appear in the menu (also the order the < > buttons step through):
+    // per group first the loose presets, then each sub-folder.
+    const std::vector<MenuEntry>& menuOrder()
+    {
+        static const std::vector<MenuEntry> order = []
+        {
+            std::vector<MenuEntry> o;
+            const auto& all = pump::genres();
+            for (size_t g = 0; g < all.size(); ++g)
+            {
+                const auto& list = all[g].presets;
+                std::vector<std::string> folders;
+                for (const auto& pr : list)
+                    if (! pr.folder.empty() && std::find (folders.begin(), folders.end(), pr.folder) == folders.end())
+                        folders.push_back (pr.folder);
+
+                for (size_t p = 0; p < list.size(); ++p)
+                    if (list[p].folder.empty())
+                        o.push_back ({ (int) g, (int) p });
+                for (const auto& f : folders)
+                    for (size_t p = 0; p < list.size(); ++p)
+                        if (list[p].folder == f)
+                            o.push_back ({ (int) g, (int) p });
+            }
+            return o;
+        }();
+        return order;
+    }
+
+    int menuPosition (int genre, int preset)
+    {
+        const auto& o = menuOrder();
+        for (size_t i = 0; i < o.size(); ++i)
+            if (o[i].genre == genre && o[i].preset == preset)
+                return (int) i;
+        return 0;
+    }
+}
+
+//==============================================================================
+PumpLookAndFeel::PumpLookAndFeel()
+{
+    setColour (juce::PopupMenu::backgroundColourId,            juce::Colour (0xff14141c));
+    setColour (juce::PopupMenu::textColourId,                  kText);
+    setColour (juce::PopupMenu::headerTextColourId,            kDim);
+    setColour (juce::PopupMenu::highlightedBackgroundColourId, juce::Colour (0xff2a2a38));
+    setColour (juce::PopupMenu::highlightedTextColourId,       juce::Colours::white);
+    setColour (juce::ComboBox::backgroundColourId,             kPanel);
+    setColour (juce::ComboBox::textColourId,                   kText);
+    setColour (juce::ComboBox::outlineColourId,                juce::Colours::white.withAlpha (0.12f));
+    setColour (juce::ComboBox::arrowColourId,                  kDim);
+    setColour (juce::TextButton::buttonColourId,               kPanel);
+    setColour (juce::TextButton::textColourOffId,              kText);
+    setColour (juce::Label::textColourId,                      kText);
+}
+
+void HelpPanel::paint (juce::Graphics& g)
+{
+    auto b = getLocalBounds().toFloat();
+    g.setColour (juce::Colour (0xff101018));
+    g.fillRoundedRectangle (b, 10.0f);
+    g.setColour (accent);
+    g.drawRoundedRectangle (b.reduced (1.0f), 10.0f, 2.0f);
+
+    auto r = getLocalBounds().reduced (28, 22);
+    g.setColour (accent);
+    g.setFont (juce::FontOptions (20.0f, juce::Font::bold));
+    g.drawText ("Choosing the sidechain track in FL Studio", r.removeFromTop (30), juce::Justification::centredLeft);
+    r.removeFromTop (6);
+
+    g.setColour (kText);
+    g.setFont (juce::FontOptions (14.0f));
+    const juce::String text =
+        "FL Studio decides which track feeds a plugin's sidechain. A plugin cannot list or pick FL's mixer tracks "
+        "itself, so this one step happens in FL. It takes 20 seconds:\n\n"
+        "1.  Put your kick on its own mixer track.\n"
+        "2.  Put PumpKit on the track of the sound you want to duck (bass, pad...).\n"
+        "3.  Click the kick's mixer track. Right-click the small send knob at the bottom of the bass track and choose "
+        "\"Sidechain to this track\".\n"
+        "4.  Open the PumpKit wrapper: click the gear icon at the top left of this window, then the Processing page. "
+        "Under Sidechain, make sure the kick's track is selected.\n"
+        "5.  Set Mode to Audio here. The meter at the bottom right moves and its light flashes on every kick.\n\n"
+        "No routing wanted?  Use Mode: Sync (follows the song tempo), Mode: MIDI, or Audio with "
+        "TRIGGER FROM = This track (listens to the sound on the track itself).\n\n"
+        "Click anywhere to close this panel.";
+    g.drawFittedText (text, r, juce::Justification::topLeft, 20, 1.0f);
+}
+
+//==============================================================================
 PumpKitEditor::PumpKitEditor (PumpKitProcessor& p)
     : juce::AudioProcessorEditor (&p), proc (p), curveEditor (p), sourceMeter (p)
 {
+    setLookAndFeel (&laf);
     setSize (840, 580);
 
     addAndMakeVisible (curveEditor);
@@ -482,8 +576,8 @@ PumpKitEditor::PumpKitEditor (PumpKitProcessor& p)
         addAndMakeVisible (l);
     };
     setupLabel (modeLabel,   "Mode",   juce::Justification::centredRight);
-    setupLabel (lengthLabel, "Length", juce::Justification::centredRight);
-    setupLabel (genreLabel,  "Genre",  juce::Justification::centredRight);
+    setupLabel (lengthLabel, "Speed",  juce::Justification::centredRight);
+    setupLabel (genreLabel,  "Preset", juce::Justification::centredRight);
     setupLabel (sourceLabel, "TRIGGER FROM", juce::Justification::centred);
 
     if (auto* mode = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter ("mode")))
@@ -492,37 +586,44 @@ PumpKitEditor::PumpKitEditor (PumpKitProcessor& p)
         lengthBox.addItemList (len->choices, 1);
     if (auto* src = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter ("scSource")))
         sourceBox.addItemList (src->choices, 1);
+    if (auto* ru = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter ("rateMode")))
+        rateUnitBox.addItemList (ru->choices, 1);
 
-    const auto& all = pump::genres();
-    for (size_t i = 0; i < all.size(); ++i)
-        genreBox.addItem (all[i].name, (int) i + 1);
-
-    genreBox.onChange = [this]
-    {
-        const int g = genreBox.getSelectedItemIndex();
-        if (g >= 0)
-            loadPreset (g, 0);
-    };
-    presetBox.onChange = [this]
-    {
-        const int pi = presetBox.getSelectedItemIndex();
-        if (pi >= 0)
-            loadPreset (proc.genreIndex.load(), pi);
-    };
+    presetButton.setClickingTogglesState (false);
+    presetButton.onClick = [this] { showPresetMenu(); };
     prevButton.onClick = [this] { stepPreset (-1); };
     nextButton.onClick = [this] { stepPreset (1); };
+    helpButton.onClick = [this]
+    {
+        helpPanel.accent = accentOf (proc);
+        helpPanel.setVisible (! helpPanel.isVisible());
+        helpPanel.toFront (false);
+    };
+    helpButton.setTooltip ("How to choose the sidechain track in FL Studio");
+
+    rateHzSlider.setSliderStyle (juce::Slider::LinearHorizontal);
+    rateHzSlider.setTextBoxStyle (juce::Slider::TextBoxRight, false, 78, 22);
+    rateHzSlider.setColour (juce::Slider::textBoxTextColourId, kText);
+    rateHzSlider.setColour (juce::Slider::textBoxOutlineColourId, juce::Colours::transparentBlack);
+    rateHzSlider.setColour (juce::Slider::thumbColourId, kText);
+    rateHzSlider.setColour (juce::Slider::trackColourId, juce::Colour (0xff3a3a4a));
 
     addAndMakeVisible (modeBox);
+    addAndMakeVisible (rateUnitBox);
     addAndMakeVisible (lengthBox);
-    addAndMakeVisible (genreBox);
-    addAndMakeVisible (presetBox);
+    addAndMakeVisible (rateHzSlider);
     addAndMakeVisible (sourceBox);
+    addAndMakeVisible (presetButton);
     addAndMakeVisible (prevButton);
     addAndMakeVisible (nextButton);
+    addAndMakeVisible (helpButton);
+    addChildComponent (helpPanel);
 
-    modeAtt   = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "mode", modeBox);
-    lengthAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "length", lengthBox);
-    sourceAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "scSource", sourceBox);
+    modeAtt     = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "mode", modeBox);
+    lengthAtt   = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "length", lengthBox);
+    sourceAtt   = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "scSource", sourceBox);
+    rateUnitAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "rateMode", rateUnitBox);
+    rateHzAtt   = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (proc.apvts, "rateHz", rateHzSlider);
 
     splitButton.setColour (juce::ToggleButton::textColourId, kText);
     addAndMakeVisible (splitButton);
@@ -541,9 +642,16 @@ PumpKitEditor::PumpKitEditor (PumpKitProcessor& p)
 
     showSelection (proc.genreIndex.load(), proc.presetIndex.load());
     applyTheme();
+    updateRateControls();
 
     startTimerHz (10);
     timerCallback();
+}
+
+PumpKitEditor::~PumpKitEditor()
+{
+    stopTimer();
+    setLookAndFeel (nullptr);
 }
 
 //==============================================================================
@@ -554,17 +662,15 @@ void PumpKitEditor::showSelection (int genre, int preset)
     const auto& list = all[(size_t) genre].presets;
     preset = juce::jlimit (0, (int) list.size() - 1, preset);
 
-    genreBox.setSelectedItemIndex (genre, juce::dontSendNotification);
+    const auto& def = list[(size_t) preset];
+    juce::String text = all[(size_t) genre].name;
+    if (! def.folder.empty())
+        text << "  >  " << def.folder;
+    text << "  >  " << def.name;
+    presetButton.setButtonText (text);
 
-    if (shownGenre != genre)
-    {
-        presetBox.clear (juce::dontSendNotification);
-        for (size_t i = 0; i < list.size(); ++i)
-            presetBox.addItem (list[i].name, (int) i + 1);
-        shownGenre = genre;
-    }
-    presetBox.setSelectedItemIndex (preset, juce::dontSendNotification);
-
+    shownGenre = genre;
+    shownPreset = preset;
     proc.genreIndex.store (genre);
     proc.presetIndex.store (preset);
 }
@@ -576,8 +682,10 @@ void PumpKitEditor::loadPreset (int genre, int preset)
     const auto& def = pump::genres()[(size_t) proc.genreIndex.load()].presets[(size_t) proc.presetIndex.load()];
     proc.curve.setNodes (def.nodes);
 
-    // each preset was drawn for a certain note length; you can still change Length afterwards
-    lengthBox.setSelectedItemIndex (juce::jlimit (0, pump::kNumLengths - 1, def.length), juce::sendNotification);
+    // each preset was drawn for a certain note length. In Hz mode the speed is left alone
+    // (so a preset never changes an automated or hand-set Hz value).
+    if (proc.apvts.getRawParameterValue ("rateMode")->load() < 0.5f)
+        lengthBox.setSelectedItemIndex (juce::jlimit (0, pump::kNumLengths - 1, def.length), juce::sendNotification);
 
     applyTheme();
     curveEditor.repaint();
@@ -585,21 +693,82 @@ void PumpKitEditor::loadPreset (int genre, int preset)
 
 void PumpKitEditor::stepPreset (int delta)
 {
-    const auto& all = pump::genres();
-    int g = proc.genreIndex.load();
-    int p = proc.presetIndex.load() + delta;
+    const auto& o = menuOrder();
+    const int n = (int) o.size();
+    const int pos = (menuPosition (proc.genreIndex.load(), proc.presetIndex.load()) + delta + n) % n;
+    loadPreset (o[(size_t) pos].genre, o[(size_t) pos].preset);
+}
 
-    if (p >= (int) all[(size_t) g].presets.size())
+// Genres open as sub-menus when you hover over them; groups with folders open one level further.
+void PumpKitEditor::showPresetMenu()
+{
+    const auto& all = pump::genres();
+    const auto& order = menuOrder();
+    const int cur = menuPosition (proc.genreIndex.load(), proc.presetIndex.load());
+    const int curGenre = proc.genreIndex.load();
+
+    auto itemFor = [&] (size_t g, size_t p, int id)
     {
-        g = (g + 1) % (int) all.size();
-        p = 0;
-    }
-    else if (p < 0)
+        juce::PopupMenu::Item it (all[g].presets[p].name);
+        it.itemID = id;
+        it.colour = juce::Colour (all[g].colour).brighter (0.25f);
+        it.isTicked = (id - 1 == cur);
+        return it;
+    };
+    auto submenuItem = [] (const juce::String& name, juce::PopupMenu sub, juce::Colour col, bool ticked)
     {
-        g = (g + (int) all.size() - 1) % (int) all.size();
-        p = (int) all[(size_t) g].presets.size() - 1;
+        juce::PopupMenu::Item it (name);
+        it.subMenu = std::make_unique<juce::PopupMenu> (std::move (sub));
+        it.colour = col;
+        it.isTicked = ticked;
+        return it;
+    };
+
+    juce::PopupMenu menu;
+    for (size_t g = 0; g < all.size(); ++g)
+    {
+        juce::PopupMenu genreMenu;
+        std::vector<std::string> folders;
+        for (const auto& pr : all[g].presets)
+            if (! pr.folder.empty() && std::find (folders.begin(), folders.end(), pr.folder) == folders.end())
+                folders.push_back (pr.folder);
+
+        for (size_t k = 0; k < order.size(); ++k)
+            if (order[k].genre == (int) g && all[g].presets[(size_t) order[k].preset].folder.empty())
+                genreMenu.addItem (itemFor (g, (size_t) order[k].preset, (int) k + 1));
+
+        if (! folders.empty() && genreMenu.getNumItems() > 0)
+            genreMenu.addSeparator();
+
+        for (const auto& f : folders)
+        {
+            juce::PopupMenu folderMenu;
+            bool hasCurrent = false;
+            for (size_t k = 0; k < order.size(); ++k)
+                if (order[k].genre == (int) g && all[g].presets[(size_t) order[k].preset].folder == f)
+                {
+                    folderMenu.addItem (itemFor (g, (size_t) order[k].preset, (int) k + 1));
+                    hasCurrent = hasCurrent || (int) k == cur;
+                }
+            genreMenu.addItem (submenuItem (f, std::move (folderMenu), juce::Colour (all[g].colour).brighter (0.25f), hasCurrent));
+        }
+
+        menu.addItem (submenuItem (all[g].name, std::move (genreMenu), juce::Colour (all[g].colour).brighter (0.1f), (int) g == curGenre));
     }
-    loadPreset (g, p);
+
+    menu.showMenuAsync (juce::PopupMenu::Options().withTargetComponent (presetButton).withMinimumWidth (presetButton.getWidth()),
+                        [this] (int result)
+                        {
+                            if (result > 0 && result <= (int) menuOrder().size())
+                                loadPreset (menuOrder()[(size_t) result - 1].genre, menuOrder()[(size_t) result - 1].preset);
+                        });
+}
+
+void PumpKitEditor::updateRateControls()
+{
+    const bool hz = proc.apvts.getRawParameterValue ("rateMode")->load() > 0.5f;
+    lengthBox.setVisible (! hz);
+    rateHzSlider.setVisible (hz);
 }
 
 void PumpKitEditor::applyTheme()
@@ -608,7 +777,10 @@ void PumpKitEditor::applyTheme()
     for (auto* k : { &mixKnob, &smoothKnob, &freqKnob, &thresholdKnob, &retriggerKnob })
         k->slider.setColour (juce::Slider::rotarySliderFillColourId, accent);
 
+    rateHzSlider.setColour (juce::Slider::trackColourId, accent.withAlpha (0.55f));
     splitButton.setColour (juce::ToggleButton::tickColourId, accent);
+    presetButton.setColour (juce::TextButton::textColourOffId, accent.brighter (0.3f));
+    helpPanel.accent = accent;
     repaint();
 }
 
@@ -641,20 +813,25 @@ void PumpKitEditor::resized()
 
     r.removeFromTop (10);
     auto top = r.removeFromTop (28);
+    helpButton.setBounds (top.removeFromRight (28));
+    top.removeFromRight (6);
+
     modeLabel.setBounds (top.removeFromLeft (40));
-    modeBox.setBounds (top.removeFromLeft (90));
-    top.removeFromLeft (12);
-    lengthLabel.setBounds (top.removeFromLeft (50));
-    lengthBox.setBounds (top.removeFromLeft (110));
-    top.removeFromLeft (12);
-    genreLabel.setBounds (top.removeFromLeft (50));
-    genreBox.setBounds (top.removeFromLeft (150));
-    top.removeFromLeft (8);
-    presetBox.setBounds (top.removeFromLeft (190));
-    top.removeFromLeft (4);
-    prevButton.setBounds (top.removeFromLeft (26));
-    top.removeFromLeft (4);
-    nextButton.setBounds (top.removeFromLeft (26));
+    modeBox.setBounds (top.removeFromLeft (84));
+    top.removeFromLeft (10);
+    lengthLabel.setBounds (top.removeFromLeft (46));
+    rateUnitBox.setBounds (top.removeFromLeft (70));
+    top.removeFromLeft (6);
+    auto speed = top.removeFromLeft (170);
+    rateHzSlider.setBounds (speed);
+    lengthBox.setBounds (speed.withWidth (110));
+    top.removeFromLeft (10);
+    genreLabel.setBounds (top.removeFromLeft (48));
+    nextButton.setBounds (top.removeFromRight (26));
+    top.removeFromRight (4);
+    prevButton.setBounds (top.removeFromRight (26));
+    top.removeFromRight (6);
+    presetButton.setBounds (top);
 
     r.removeFromTop (10);
     auto knobRow = r.removeFromBottom (150);
@@ -681,6 +858,8 @@ void PumpKitEditor::resized()
     sourceBox.setBounds (src.removeFromTop (28));
     src.removeFromTop (14);
     sourceMeter.setBounds (src.removeFromTop (22));
+
+    helpPanel.setBounds (getLocalBounds().reduced (50, 70));
 }
 
 void PumpKitEditor::timerCallback()
@@ -694,19 +873,21 @@ void PumpKitEditor::timerCallback()
     retriggerKnob.slider.setEnabled (audio);
     sourceBox.setEnabled (audio);
     freqKnob.slider.setEnabled (split);
+    updateRateControls();
 
-    // follow the menus when a project loads while the window is open
-    if (proc.genreIndex.load() != genreBox.getSelectedItemIndex()
-        || proc.presetIndex.load() != presetBox.getSelectedItemIndex())
+    // follow the preset button when a project loads while the window is open
+    if (proc.genreIndex.load() != shownGenre || proc.presetIndex.load() != shownPreset)
     {
         showSelection (proc.genreIndex.load(), proc.presetIndex.load());
         applyTheme();
     }
 
     const bool signal = proc.uiSrcLevel.load() > 0.002f;
+    const bool hz = proc.apvts.getRawParameterValue ("rateMode")->load() > 0.5f;
 
     if (mode == 0)
-        statusLabel.setText ("Sync: follows the host tempo while playing", juce::dontSendNotification);
+        statusLabel.setText (hz ? "Sync: runs at the Hz speed while playing" : "Sync: follows the host tempo while playing",
+                             juce::dontSendNotification);
     else if (mode == 1)
         statusLabel.setText ("MIDI: every note-on triggers the curve", juce::dontSendNotification);
     else if (signal)
@@ -714,6 +895,6 @@ void PumpKitEditor::timerCallback()
                                  : "Audio: sidechain signal detected", juce::dontSendNotification);
     else
         statusLabel.setText (own ? "Audio: no sound on this track yet"
-                                 : "Audio: nothing on the sidechain input. In FL: Sidechain to this track, then gear > Processing",
+                                 : "Audio: no sidechain signal yet. Click ? for the 20-second FL setup",
                              juce::dontSendNotification);
 }

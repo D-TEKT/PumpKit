@@ -59,11 +59,28 @@ private:
 };
 
 //==============================================================================
+// Menu colours that match the dark theme
+class PumpLookAndFeel : public juce::LookAndFeel_V4
+{
+public:
+    PumpLookAndFeel();
+};
+
+// Panel that explains how to pick the sidechain track in FL Studio
+class HelpPanel : public juce::Component
+{
+public:
+    void paint (juce::Graphics&) override;
+    void mouseDown (const juce::MouseEvent&) override { setVisible (false); }
+    juce::Colour accent { 0xffff3b3b };
+};
+
+//==============================================================================
 class PumpKitEditor : public juce::AudioProcessorEditor, private juce::Timer
 {
 public:
     explicit PumpKitEditor (PumpKitProcessor&);
-    ~PumpKitEditor() override { stopTimer(); }
+    ~PumpKitEditor() override;
 
     void paint (juce::Graphics&) override;
     void resized() override;
@@ -71,9 +88,11 @@ public:
 private:
     void timerCallback() override;
 
-    void showSelection (int genre, int preset);   // update the menus only
-    void loadPreset (int genre, int preset);      // update the menus and load the curve
+    void showSelection (int genre, int preset);   // update the button only
+    void loadPreset (int genre, int preset);      // update the button and load the curve
     void stepPreset (int delta);
+    void showPresetMenu();
+    void updateRateControls();
     void applyTheme();
 
     struct Knob
@@ -86,19 +105,23 @@ private:
     };
 
     PumpKitProcessor& proc;
+    PumpLookAndFeel laf;
 
     CurveEditor curveEditor;
     SourceMeter sourceMeter;
-    juce::ComboBox modeBox, lengthBox, genreBox, presetBox, sourceBox;
-    juce::TextButton prevButton { "<" }, nextButton { ">" };
+    HelpPanel helpPanel;
+    juce::ComboBox modeBox, lengthBox, rateUnitBox, sourceBox;
+    juce::TextButton presetButton, prevButton { "<" }, nextButton { ">" }, helpButton { "?" };
+    juce::Slider rateHzSlider;
     juce::Label modeLabel, lengthLabel, genreLabel, sourceLabel, statusLabel;
     juce::ToggleButton splitButton { "Band Split" };
     Knob mixKnob, smoothKnob, freqKnob, thresholdKnob, retriggerKnob;
 
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> modeAtt, lengthAtt, sourceAtt;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> modeAtt, lengthAtt, sourceAtt, rateUnitAtt;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> rateHzAtt;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> splitAtt;
 
-    int shownGenre = -1;
+    int shownGenre = -1, shownPreset = -1;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PumpKitEditor)
 };

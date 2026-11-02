@@ -99,8 +99,8 @@ inline float presetValue (int preset, float x)
 
 //==============================================================================
 // A curve point. Between this point and the next one the line is straight, plus a
-// "bend": the middle of the segment is pushed up (+) or down (-) by this amount,
-// following a smooth arch. 0 = straight. The bend dot in the editor sets it.
+// "bend": how far the middle dot of the line was dragged up (+) or down (-). 0 = straight.
+// See segmentValue() for how that becomes a smooth, never-clipping curve.
 struct Node
 {
     float x = 0.0f;      // time in the cycle, 0..1
@@ -108,9 +108,45 @@ struct Node
     float bend = 0.0f;   // bend of the segment that starts at this point (-1..1)
 };
 
+// Value of one line (from volume ya to yb) at position u (0..1) along it.
+// "bend" is how far you dragged the middle dot, in volume units. The line never goes
+// above or below its two end points and never clips flat: the further you drag, the
+// more gently the shape follows (the effect fades off smoothly instead of hitting a wall).
 inline float segmentValue (float ya, float yb, float bend, float u)
 {
-    return std::clamp (ya + (yb - ya) * u + bend * 4.0f * u * (1.0f - u), 0.0f, 1.0f);
+    const float d = yb - ya;
+    const float ad = std::fabs (d);
+
+    // flat (or almost flat) lines can only arch up or down a little
+    const float archOffset = 0.4f * std::tanh (bend / 0.4f);
+    float y = ya + d * u + archOffset * 4.0f * u * (1.0f - u);
+
+    if (ad >= 0.02f)
+    {
+        // sloped lines become a power curve: where the middle dot sits between the two ends
+        const float t = 0.5f + 0.4f * std::tanh (bend / (0.4f * d));
+        const float p = std::log (t) / std::log (0.5f);
+        const float curved = ya + d * std::pow (u, p);
+
+        const float w = std::clamp ((ad - 0.02f) / 0.10f, 0.0f, 1.0f);   // fade between the two kinds
+        y += (curved - y) * w;
+    }
+    return std::clamp (y, 0.0f, 1.0f);
+}
+
+// The bend value that puts the middle of a line at `ymid` (used when turning sampled shapes into points)
+inline float bendForMid (float ya, float yb, float ymid)
+{
+    const float d = yb - ya;
+    const float off = ymid - 0.5f * (ya + yb);
+
+    if (std::fabs (d) >= 0.12f)
+    {
+        const float te = std::clamp (off / d, -0.39f, 0.39f);
+        return std::clamp (d * 0.4f * std::atanh (te / 0.4f), -1.0f, 1.0f);
+    }
+    const float oe = std::clamp (off, -0.39f, 0.39f);
+    return std::clamp (0.4f * std::atanh (oe / 0.4f), -1.0f, 1.0f);
 }
 
 //------------------------------------------------------------------------------
@@ -129,7 +165,7 @@ inline void fitRange (const std::vector<float>& ys, int a, int b, float tol, std
         const int i0 = (int) std::floor (pos);
         const float fr = pos - (float) i0;
         const float ymid = ys[(size_t) i0] + (ys[(size_t) std::min (i0 + 1, b)] - ys[(size_t) i0]) * fr;
-        bend = std::clamp (ymid - 0.5f * (ya + yb), -1.0f, 1.0f);
+        bend = bendForMid (ya, yb, ymid);
     }
 
     float worst = 0.0f;
@@ -485,6 +521,43 @@ private:
     float timeCur = 2.0f, timeTarget = 2.0f, glide = 0.01f, coef = 0.1f;
     float v1 = 1.0f, v2 = 1.0f;
     unsigned counter = 0;
+};
+
+//==============================================================================
+// Speed in Hz: a free-running position in the cycle (0..1) that advances `hz` times per second.
+// The rate itself glides to a new value (in the log domain, so a sweep from 1 to 8 Hz feels
+// even), which is what makes automating the speed sound smooth instead of stepping.
+constexpr float kMinHz = 0.05f;
+constexpr float kMaxHz = 40.0f;
+
+class HzPhase
+{
+public:
+    void prepare (double sr, float hz)
+    {
+        sampleRate = sr;
+        coef = (float) (1.0 - std::exp (-1.0 / (0.05 * sr)));   // ~50 ms glide
+        target = cur = std::log (std::clamp (hz, kMinHz, kMaxHz));
+        phase = 0.0;
+    }
+
+    void setHz (float hz) { target = std::log (std::clamp (hz, kMinHz, kMaxHz)); }
+    void restart()        { phase = 0.0; }
+    float currentHz() const { return std::exp (cur); }
+
+    // position in the cycle for this sample, then move on by one sample
+    double next()
+    {
+        cur += coef * (target - cur);
+        const double p = phase;
+        phase += (double) std::exp (cur) / sampleRate;
+        phase -= std::floor (phase);
+        return p;
+    }
+
+private:
+    double sampleRate = 44100.0, phase = 0.0;
+    float coef = 0.0004f, cur = 0.0f, target = 0.0f;
 };
 
 //==============================================================================
