@@ -8,6 +8,7 @@
 
 #include "PumpEngine.h"
 #include "Presets.h"
+#include "LinkBus.h"
 
 class PumpKitProcessor : public juce::AudioProcessor
 {
@@ -66,6 +67,7 @@ private:
     std::atomic<float>* pSource    = nullptr;
     std::atomic<float>* pRateMode  = nullptr;
     std::atomic<float>* pRateHz    = nullptr;
+    std::atomic<float>* pSendTo    = nullptr;
 
     double sampleRate = 44100.0;
     double lastBpm = 120.0;
@@ -82,6 +84,7 @@ private:
     juce::SmoothedValue<float> mixSmooth;
     juce::dsp::LinkwitzRileyFilter<float> crossover;
     std::vector<int> trigPos;
+    std::vector<float> linkTmp;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PumpKitProcessor)
 };

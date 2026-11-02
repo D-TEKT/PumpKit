@@ -110,14 +110,14 @@ private:
     CurveEditor curveEditor;
     SourceMeter sourceMeter;
     HelpPanel helpPanel;
-    juce::ComboBox modeBox, lengthBox, rateUnitBox, sourceBox;
+    juce::ComboBox modeBox, lengthBox, rateUnitBox, sourceBox, sendBox;
     juce::TextButton presetButton, prevButton { "<" }, nextButton { ">" }, helpButton { "?" };
     juce::Slider rateHzSlider;
     juce::Label modeLabel, lengthLabel, genreLabel, sourceLabel, statusLabel;
     juce::ToggleButton splitButton { "Band Split" };
     Knob mixKnob, smoothKnob, freqKnob, thresholdKnob, retriggerKnob;
 
-    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> modeAtt, lengthAtt, sourceAtt, rateUnitAtt;
+    std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> modeAtt, lengthAtt, sourceAtt, rateUnitAtt, sendAtt;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> rateHzAtt;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> splitAtt;
 

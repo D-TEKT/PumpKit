@@ -62,7 +62,11 @@ juce::AudioProcessorValueTreeState::ParameterLayout PumpKitProcessor::createLayo
 
     // Audio mode: listen to the sidechain input, or to the sound on this track itself
     layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "scSource", 1 }, "Trigger From",
-                                                        StringArray { "Sidechain", "This track" }, 0));
+                                                        StringArray { "Sidechain", "This track", "Link A", "Link B", "Link C", "Link D", "Link E", "Link F", "Link G", "Link H" }, 0));
+
+    // Send this track's sound to a link channel, so another PumpKit can listen to it (this track is not changed)
+    layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "sendTo", 1 }, "Send To",
+                                                        StringArray { "Not sending", "Send to A", "Send to B", "Send to C", "Send to D", "Send to E", "Send to F", "Send to G", "Send to H" }, 0));
 
     // Speed: in note lengths (follows the song tempo) or in Hz (free speed, easy to automate)
     layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "rateMode", 1 }, "Rate Unit",
@@ -98,6 +102,7 @@ PumpKitProcessor::PumpKitProcessor()
     pSource    = apvts.getRawParameterValue ("scSource");
     pRateMode  = apvts.getRawParameterValue ("rateMode");
     pRateHz    = apvts.getRawParameterValue ("rateHz");
+    pSendTo    = apvts.getRawParameterValue ("sendTo");
 
     for (auto* arr : { &scopeIn, &scopeOut, &scopeSc })
         for (auto& v : *arr)
@@ -107,6 +112,7 @@ PumpKitProcessor::PumpKitProcessor()
     curve.setNodes (pump::genres()[0].presets[0].nodes);
 
     trigPos.reserve (2048);
+    linkTmp.reserve (8192);
 }
 
 bool PumpKitProcessor::isBusesLayoutSupported (const BusesLayout& layouts) const
@@ -134,6 +140,7 @@ void PumpKitProcessor::prepareToPlay (double sr, int samplesPerBlock)
     lastCutoff = -1.0f;
     wasSplit = false;
 
+    linkTmp.reserve ((size_t) std::max (samplesPerBlock, 8192));
     smoother.prepare (sr);
     smoother.reset (1.0f);
     onset.prepare (sr);
@@ -164,8 +171,40 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     const int mode       = (int) pMode->load();
     const int lengthIdx  = (int) pLength->load();
     const bool split     = pSplit->load() > 0.5f;
-    const bool ownSource = pSource->load() > 0.5f;
+    const int  srcChoice = (int) pSource->load();             // 0 sidechain input, 1 this track, 2..9 link A..H
+    const bool ownSource = srcChoice == 1;
+    const int  linkIn    = srcChoice >= 2 ? srcChoice - 2 : -1;
+    const int  sendTo    = (int) pSendTo->load() - 1;         // -1 = not sending
     const bool useHz     = pRateMode->load() > 0.5f;
+
+    // ---- send mode: this track only reports its level to a link channel and is not changed
+    if (sendTo >= 0)
+    {
+        linkTmp.resize ((size_t) numSamples);
+        float peak = 0.0f;
+        for (int i = 0; i < numSamples; ++i)
+        {
+            float l = 0.0f;
+            for (int c = 0; c < numCh; ++c)
+                l = std::max (l, std::abs (buffer.getReadPointer (c)[i]));
+            linkTmp[(size_t) i] = l;
+            peak = std::max (peak, l);
+        }
+        pump::linkSend (sendTo, linkTmp.data(), numSamples);
+        uiPhase.store (-1.0f);
+        uiSrcLevel.store (std::max (peak, uiSrcLevel.load() * 0.9f));
+        midi.clear();
+        return;
+    }
+
+    // ---- listen mode: fetch the levels sent by another PumpKit
+    const float* linkLevels = nullptr;
+    if (linkIn >= 0)
+    {
+        linkTmp.resize ((size_t) numSamples);
+        pump::linkReceive (linkIn, linkTmp.data(), numSamples);
+        linkLevels = linkTmp.data();
+    }
 
     if (useHz)
         hzPhase.setHz (pRateHz->load());
@@ -266,7 +305,7 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
         for (int c = 0; c < scCh; ++c)
             scIn = std::max (scIn, std::abs (sc[c][i]));
 
-        const float srcLevel = ownSource ? own : scIn;   // what triggers the curve in Audio mode
+        const float srcLevel = linkLevels != nullptr ? linkLevels[i] : (ownSource ? own : scIn);   // what triggers the curve in Audio mode
         srcPeak = std::max (srcPeak, srcLevel);
 
         float g = 1.0f;

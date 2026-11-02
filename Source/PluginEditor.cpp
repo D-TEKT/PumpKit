@@ -537,23 +537,24 @@ void HelpPanel::paint (juce::Graphics& g)
     auto r = getLocalBounds().reduced (28, 22);
     g.setColour (accent);
     g.setFont (juce::FontOptions (20.0f, juce::Font::bold));
-    g.drawText ("Choosing the sidechain track in FL Studio", r.removeFromTop (30), juce::Justification::centredLeft);
+    g.drawText ("Choosing the sidechain source", r.removeFromTop (30), juce::Justification::centredLeft);
     r.removeFromTop (6);
 
     g.setColour (kText);
     g.setFont (juce::FontOptions (14.0f));
     const juce::String text =
-        "FL Studio decides which track feeds a plugin's sidechain. A plugin cannot list or pick FL's mixer tracks "
-        "itself, so this one step happens in FL. It takes 20 seconds:\n\n"
-        "1.  Put your kick on its own mixer track.\n"
-        "2.  Put PumpKit on the track of the sound you want to duck (bass, pad...).\n"
-        "3.  Click the kick's mixer track. Right-click the small send knob at the bottom of the bass track and choose "
-        "\"Sidechain to this track\".\n"
-        "4.  Open the PumpKit wrapper: click the gear icon at the top left of this window, then the Processing page. "
-        "Under Sidechain, make sure the kick's track is selected.\n"
-        "5.  Set Mode to Audio here. The meter at the bottom right moves and its light flashes on every kick.\n\n"
-        "No routing wanted?  Use Mode: Sync (follows the song tempo), Mode: MIDI, or Audio with "
-        "TRIGGER FROM = This track (listens to the sound on the track itself).\n\n"
+        "FL Studio's own plugins (like Fruity Limiter) can list FL's mixer tracks. Plugins in the VST3 format cannot, "
+        "so PumpKit has its own way to choose the source, inside the plugin. It takes 4 steps:\n\n"
+        "1.  Put a PumpKit on the kick's mixer track. Set SEND (bottom right) to \"Send to A\". "
+        "The kick is not changed by it, it only reports its sound to channel A.\n"
+        "2.  Put another PumpKit on the track you want to duck (bass, pad...).\n"
+        "3.  On that one: Mode = Audio, TRIGGER FROM = \"Link A\".\n"
+        "4.  Play. The meter moves and the light flashes on every kick. Pick the same letter on both. "
+        "You can use up to 8 channels (A to H), one sender per letter.\n\n"
+        "Tip: if the pump feels a little late, put the kick on a lower-numbered mixer track than the bass, "
+        "or lower FL's buffer size.\n\n"
+        "Other ways: Mode Sync (follows the song tempo), Mode MIDI, TRIGGER FROM = This track, or FL's own routing "
+        "(right-click the send knob, \"Sidechain to this track\", then the wrapper's Processing page) with TRIGGER FROM = Sidechain.\n\n"
         "Click anywhere to close this panel.";
     g.drawFittedText (text, r, juce::Justification::topLeft, 20, 1.0f);
 }
@@ -586,6 +587,8 @@ PumpKitEditor::PumpKitEditor (PumpKitProcessor& p)
         lengthBox.addItemList (len->choices, 1);
     if (auto* src = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter ("scSource")))
         sourceBox.addItemList (src->choices, 1);
+    if (auto* sd = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter ("sendTo")))
+        sendBox.addItemList (sd->choices, 1);
     if (auto* ru = dynamic_cast<juce::AudioParameterChoice*> (proc.apvts.getParameter ("rateMode")))
         rateUnitBox.addItemList (ru->choices, 1);
 
@@ -613,6 +616,7 @@ PumpKitEditor::PumpKitEditor (PumpKitProcessor& p)
     addAndMakeVisible (lengthBox);
     addAndMakeVisible (rateHzSlider);
     addAndMakeVisible (sourceBox);
+    addAndMakeVisible (sendBox);
     addAndMakeVisible (presetButton);
     addAndMakeVisible (prevButton);
     addAndMakeVisible (nextButton);
@@ -622,6 +626,7 @@ PumpKitEditor::PumpKitEditor (PumpKitProcessor& p)
     modeAtt     = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "mode", modeBox);
     lengthAtt   = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "length", lengthBox);
     sourceAtt   = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "scSource", sourceBox);
+    sendAtt     = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "sendTo", sendBox);
     rateUnitAtt = std::make_unique<juce::AudioProcessorValueTreeState::ComboBoxAttachment> (proc.apvts, "rateMode", rateUnitBox);
     rateHzAtt   = std::make_unique<juce::AudioProcessorValueTreeState::SliderAttachment> (proc.apvts, "rateHz", rateHzSlider);
 
@@ -856,8 +861,10 @@ void PumpKitEditor::resized()
     sourceLabel.setBounds (src.removeFromTop (18));
     src.removeFromTop (8);
     sourceBox.setBounds (src.removeFromTop (28));
-    src.removeFromTop (14);
-    sourceMeter.setBounds (src.removeFromTop (22));
+    src.removeFromTop (8);
+    sourceMeter.setBounds (src.removeFromTop (20));
+    src.removeFromTop (8);
+    sendBox.setBounds (src.removeFromTop (26));
 
     helpPanel.setBounds (getLocalBounds().reduced (50, 70));
 }
@@ -866,12 +873,14 @@ void PumpKitEditor::timerCallback()
 {
     const int mode = (int) proc.apvts.getRawParameterValue ("mode")->load();
     const bool audio = mode == 2;
-    const bool own = proc.apvts.getRawParameterValue ("scSource")->load() > 0.5f;
+    const bool own = (int) proc.apvts.getRawParameterValue ("scSource")->load() == 1;
     const bool split = proc.apvts.getRawParameterValue ("bandSplit")->load() > 0.5f;
 
     thresholdKnob.slider.setEnabled (audio);
     retriggerKnob.slider.setEnabled (audio);
-    sourceBox.setEnabled (audio);
+    const bool sending = proc.apvts.getRawParameterValue ("sendTo")->load() > 0.5f;
+    sourceBox.setEnabled (audio && ! sending);
+    sendBox.setTooltip ("Send this track's sound to a link channel so another PumpKit can listen to it. This track is not changed.");
     freqKnob.slider.setEnabled (split);
     updateRateControls();
 
@@ -883,18 +892,24 @@ void PumpKitEditor::timerCallback()
     }
 
     const bool signal = proc.uiSrcLevel.load() > 0.002f;
+    const int srcChoice = (int) proc.apvts.getRawParameterValue ("scSource")->load();
     const bool hz = proc.apvts.getRawParameterValue ("rateMode")->load() > 0.5f;
 
-    if (mode == 0)
+    if (sending)
+        statusLabel.setText ("Sending to " + sendBox.getText().fromFirstOccurrenceOf ("Send to ", false, false)
+                             + ": this track is not changed", juce::dontSendNotification);
+    else if (mode == 0)
         statusLabel.setText (hz ? "Sync: runs at the Hz speed while playing" : "Sync: follows the host tempo while playing",
                              juce::dontSendNotification);
     else if (mode == 1)
         statusLabel.setText ("MIDI: every note-on triggers the curve", juce::dontSendNotification);
     else if (signal)
         statusLabel.setText (own ? "Audio: listening to the sound on this track"
-                                 : "Audio: sidechain signal detected", juce::dontSendNotification);
+                                 : (srcChoice >= 2 ? "Audio: receiving " + sourceBox.getText() : juce::String ("Audio: sidechain signal detected")),
+                             juce::dontSendNotification);
     else
         statusLabel.setText (own ? "Audio: no sound on this track yet"
-                                 : "Audio: no sidechain signal yet. Click ? for the 20-second FL setup",
+                                 : (srcChoice >= 2 ? "Audio: nothing arriving on " + sourceBox.getText() + ". Is a PumpKit on the kick set to Send?"
+                                                   : juce::String ("Audio: no sidechain signal yet. Click ? for setup help")),
                              juce::dontSendNotification);
 }
