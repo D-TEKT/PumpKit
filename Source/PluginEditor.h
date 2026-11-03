@@ -43,6 +43,7 @@ public:
 private:
     pump::CurveTable& curveRef() const;
     int slotType() const;
+    int slotStyle() const;
     float slotDepth() const;
     struct GridLine { float x; bool major; };
     std::vector<GridLine> buildGrid() const;
@@ -148,6 +149,7 @@ private:
     void selectSlot (int slot);
     void showAddMenu();
     void showSlotMenu (int slot);
+    void refreshEffectPanel (bool force);
 
     struct Knob
     {
@@ -156,6 +158,7 @@ private:
         std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> attachment;
 
         void init (PumpKitEditor& owner, const juce::String& paramId, const juce::String& text);
+        void bind (PumpKitEditor& owner, const juce::String& paramId);
     };
 
     PumpKitProcessor& proc;
@@ -166,18 +169,19 @@ private:
     TabStrip tabs;
     HelpPanel helpPanel;
     StartScreen startScreen;
-    juce::ComboBox modeBox, lengthBox, rateUnitBox, sourceBox, combineBox, gridBox;
+    juce::ComboBox modeBox, lengthBox, rateUnitBox, sourceBox, combineBox, gridBox, styleBox;
     juce::TextButton presetButton, prevButton { "<" }, nextButton { ">" }, helpButton { "?" };
     juce::Slider rateHzSlider;
-    juce::Label modeLabel, lengthLabel, genreLabel, sourceLabel, statusLabel, combineLabel, gridLabel;
+    juce::Label modeLabel, lengthLabel, genreLabel, sourceLabel, statusLabel, combineLabel, gridLabel, styleLabel, effectHint;
     juce::ToggleButton splitButton { "Band Split" }, magnetButton { "Magnet" };
-    Knob mixKnob, depthKnob, smoothKnob, freqKnob, thresholdKnob, retriggerKnob;
+    Knob mixKnob, depthKnob, smoothKnob, freqKnob, thresholdKnob, retriggerKnob, paramKnob;
+    juce::Rectangle<int> topPanel, effectPanel, outputPanel, triggerPanel, toolbarRow;
 
     std::unique_ptr<juce::AudioProcessorValueTreeState::ComboBoxAttachment> modeAtt, lengthAtt, sourceAtt, rateUnitAtt, combineAtt, gridAtt;
     std::unique_ptr<juce::AudioProcessorValueTreeState::SliderAttachment> rateHzAtt;
     std::unique_ptr<juce::AudioProcessorValueTreeState::ButtonAttachment> splitAtt, magnetAtt;
 
-    int shownGenre = -1, shownPreset = -1, shownSlot = -1;
+    int shownGenre = -1, shownPreset = -1, shownSlot = -1, shownKey = -1;
 
     JUCE_DECLARE_NON_COPYABLE_WITH_LEAK_DETECTOR (PumpKitEditor)
 };

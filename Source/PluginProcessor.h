@@ -81,7 +81,7 @@ private:
     std::atomic<float>* pRateMode  = nullptr;
     std::atomic<float>* pRateHz    = nullptr;
     std::atomic<float>* pCombine   = nullptr;
-    std::array<std::atomic<float>*, pump::kMaxSlots> pType {}, pDepth {}, pOn {};
+    std::array<std::atomic<float>*, pump::kMaxSlots> pType {}, pDepth {}, pOn {}, pStyle {}, pParam {};
 
     double sampleRate = 44100.0;
     double lastBpm = 120.0;

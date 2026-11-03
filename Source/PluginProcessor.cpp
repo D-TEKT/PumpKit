@@ -89,6 +89,12 @@ juce::AudioProcessorValueTreeState::ParameterLayout PumpKitProcessor::createLayo
             ParameterID { "m" + n + "Depth", 1 }, "Module " + n + " Depth", NormalisableRange<float> (0.0f, 100.0f, 0.1f), 100.0f,
             AudioParameterFloatAttributes().withStringFromValueFunction (pctText).withValueFromStringFunction (parseNumber)));
         layout.add (std::make_unique<AudioParameterBool> (ParameterID { "m" + n + "On", 1 }, "Module " + n + " On", true));
+        // the option of the effect (low-pass/high-pass, overdrive/fuzz..., pitch range) and its second knob (resonance, tone)
+        layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "m" + n + "Style", 1 }, "Module " + n + " Style",
+                                                            StringArray { "Option 1", "Option 2", "Option 3", "Option 4", "Option 5", "Option 6", "Option 7", "Option 8" }, 0));
+        layout.add (std::make_unique<AudioParameterFloat> (
+            ParameterID { "m" + n + "Param", 1 }, "Module " + n + " Extra", NormalisableRange<float> (0.0f, 100.0f, 0.1f), 50.0f,
+            AudioParameterFloatAttributes().withStringFromValueFunction (pctText).withValueFromStringFunction (parseNumber)));
     }
 
     layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "combine", 1 }, "Combine",
@@ -96,7 +102,7 @@ juce::AudioProcessorValueTreeState::ParameterLayout PumpKitProcessor::createLayo
 
     // editor helpers (remembered with the project, not meant for automation)
     layout.add (std::make_unique<AudioParameterChoice> (ParameterID { "gridDiv", 1 }, "Grid",
-                                                        StringArray { "Off", "2", "4", "8", "16", "32" }, 2,
+                                                        StringArray { "Off", "2", "4", "8", "16", "32", "3 (triplet)", "6 (triplet)", "12 (triplet)", "24 (triplet)" }, 2,
                                                         AudioParameterChoiceAttributes().withAutomatable (false)));
     layout.add (std::make_unique<AudioParameterBool> (ParameterID { "magnet", 1 }, "Magnet", true,
                                                       AudioParameterBoolAttributes().withAutomatable (false)));
@@ -131,6 +137,8 @@ PumpKitProcessor::PumpKitProcessor()
         pType[(size_t) s]  = apvts.getRawParameterValue ("m" + n + "Type");
         pDepth[(size_t) s] = apvts.getRawParameterValue ("m" + n + "Depth");
         pOn[(size_t) s]    = apvts.getRawParameterValue ("m" + n + "On");
+        pStyle[(size_t) s] = apvts.getRawParameterValue ("m" + n + "Style");
+        pParam[(size_t) s] = apvts.getRawParameterValue ("m" + n + "Param");
     }
 
     for (auto* arr : { &scopeIn, &scopeOut, &scopeSc })
@@ -211,6 +219,8 @@ void PumpKitProcessor::copyModule (int from, int to)
     setPlain ("m" + t + "Type",  getPlain ("m" + f + "Type"));
     setPlain ("m" + t + "Depth", getPlain ("m" + f + "Depth"));
     setPlain ("m" + t + "On",    getPlain ("m" + f + "On"));
+    setPlain ("m" + t + "Style", getPlain ("m" + f + "Style"));
+    setPlain ("m" + t + "Param", getPlain ("m" + f + "Param"));
     curves[(size_t) to].setNodes (curves[(size_t) from].getNodes());
 }
 
@@ -224,6 +234,8 @@ int PumpKitProcessor::addModule (int type)
             setPlain ("m" + n + "Type", (float) type);
             setPlain ("m" + n + "Depth", 100.0f);
             setPlain ("m" + n + "On", 1.0f);
+            setPlain ("m" + n + "Style", 0.0f);
+            setPlain ("m" + n + "Param", pump::fxParamDefault (type));
             curves[(size_t) s].setNodes (pump::defaultNodes (type));
             selectedSlot.store (s);
             return s;
@@ -256,7 +268,8 @@ void PumpKitProcessor::moveModule (int slot, int delta)
         return;
 
     const juce::String a (slot + 1);
-    const float type = getPlain ("m" + a + "Type"), depth = getPlain ("m" + a + "Depth"), on = getPlain ("m" + a + "On");
+    const float type = getPlain ("m" + a + "Type"), depth = getPlain ("m" + a + "Depth"), on = getPlain ("m" + a + "On"),
+                style = getPlain ("m" + a + "Style"), param = getPlain ("m" + a + "Param");
     const auto nodes = curves[(size_t) slot].getNodes();
 
     copyModule (other, slot);
@@ -264,6 +277,8 @@ void PumpKitProcessor::moveModule (int slot, int delta)
     setPlain ("m" + b + "Type", type);
     setPlain ("m" + b + "Depth", depth);
     setPlain ("m" + b + "On", on);
+    setPlain ("m" + b + "Style", style);
+    setPlain ("m" + b + "Param", param);
     curves[(size_t) other].setNodes (nodes);
 
     selectedSlot.store (other);
@@ -274,6 +289,8 @@ void PumpKitProcessor::startWith (int type)
     setPlain ("m1Type", (float) type);
     setPlain ("m1Depth", 100.0f);
     setPlain ("m1On", 1.0f);
+    setPlain ("m1Style", 0.0f);
+    setPlain ("m1Param", pump::fxParamDefault (type));
     curves[0].setNodes (pump::defaultNodes (type));
     selectedSlot.store (0);
     started.store (true);
@@ -306,8 +323,8 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
     onset.setParams (pThreshold->load(), pRetrigger->load());
 
     // ---- the effect modules: which are active, and reset what changed
-    int slotType[pump::kMaxSlots];
-    float slotDepth[pump::kMaxSlots];
+    int slotType[pump::kMaxSlots], slotStyle[pump::kMaxSlots];
+    float slotDepth[pump::kMaxSlots], slotParam[pump::kMaxSlots];
     bool anyVolumeSplit = false;
     for (size_t s = 0; s < (size_t) pump::kMaxSlots; ++s)
     {
@@ -316,12 +333,15 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             t = pump::fxOff;
         slotType[s] = t;
         slotDepth[s] = pDepth[s]->load() * 0.01f;
+        slotStyle[s] = std::clamp ((int) pStyle[s]->load(), 0, std::max (0, pump::fxStyleCount (t) - 1));
+        slotParam[s] = pParam[s]->load() * 0.01f;
 
-        if (t != lastType[s])
+        const int key = t * 16 + slotStyle[s];   // a different effect or option rests at a different value
+        if (key != lastType[s])
         {
-            lastType[s] = t;
+            lastType[s] = key;
             fx[s].reset();
-            smoothers[s].reset (pump::fxNeutral (t));
+            smoothers[s].reset (pump::fxNeutral (t, slotStyle[s]));
             crossovers[s].reset();
         }
         smoothers[s].setTimeMs (pSmooth->load());
@@ -486,7 +506,7 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             if (t == pump::fxOff)
                 continue;
 
-            const float v  = ph >= 0.0f ? curves[s].eval (ph) : pump::fxNeutral (t);
+            const float v  = ph >= 0.0f ? curves[s].eval (ph) : pump::fxNeutral (t, slotStyle[s]);
             const float vs = smoothers[s].process (v);
 
             float y[2] = { chain ? cur[0] : in[0], chain ? cur[1] : in[1] };
@@ -510,7 +530,7 @@ void PumpKitProcessor::processBlock (juce::AudioBuffer<float>& buffer, juce::Mid
             }
             else
             {
-                fx[s].process (t, vs, slotDepth[s], y, numCh);
+                fx[s].process (t, slotStyle[s], vs, slotDepth[s], slotParam[s], y, numCh);
             }
 
             if (chain)
